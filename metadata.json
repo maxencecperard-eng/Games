@@ -1,0 +1,6 @@
+{
+  "name": "VoxelCraft 3D - Jeu de Construction de Blocs",
+  "description": "Jeu de construction 3D dans le style Minecraft avec monde procédural, physique et vol, cycle jour/nuit, son spatialisé et mode créatif.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
