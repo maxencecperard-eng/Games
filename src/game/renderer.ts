@@ -717,7 +717,13 @@ export class GameRenderer {
       this.updateRaycast();
       this.updateHand(delta);
       this.updatePrimedTNTs(delta);
-      this.mobs.update(delta, this.physics.position, this.isDay, this.onPlayerHit);
+      this.mobs.update(
+        delta,
+        this.physics.position,
+        this.isDay,
+        this.physics.isFlying,
+        this.onPlayerHit
+      );
       this.particles.update(delta);
 
       // Synchronisation des chunks (chargement / déchargement)

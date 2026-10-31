@@ -53,9 +53,9 @@ const MOB_STATS: Record<MobType, MobStats> = {
     hostile: true,
     radius: 0.34,
     height: 1.95,
-    speed: 1.6,
+    speed: 1.5,
     maxHealth: 20,
-    damage: 2,
+    damage: 1,
   },
   skeleton: {
     name: 'Squelette',
@@ -63,9 +63,9 @@ const MOB_STATS: Record<MobType, MobStats> = {
     hostile: true,
     radius: 0.3,
     height: 1.9,
-    speed: 1.9,
+    speed: 1.7,
     maxHealth: 20,
-    damage: 3,
+    damage: 1,
   },
 };
 
@@ -78,7 +78,7 @@ const PLAYER_HEIGHT = 1.8;
 /** Tolérance verticale de contact (évite les faux positifs d'arrondi). */
 const VERTICAL_CONTACT_TOLERANCE = 0.05;
 /** Écart vertical maximal pour qu'une créature hostile poursuive le joueur. */
-const MAX_CHASE_HEIGHT = 6;
+const MAX_CHASE_HEIGHT = 2.5;
 
 interface MobHealthBar {
   canvas: HTMLCanvasElement;
@@ -141,7 +141,7 @@ export class MobManager {
   private isDay = true;
   private spawnTimer = 1.5;
   private maxPassive = 8;
-  private maxHostile = 10;
+  private maxHostile = 4;
   private despawnDistance = 62;
   private onPlayerHit?: (damage: number, source: string) => void;
 
@@ -160,8 +160,9 @@ export class MobManager {
     for (let i = this.mobs.length - 1; i >= 0; i--) {
       this.removeMob(i);
     }
-    this.spawnTimer = 0.8;
-    for (let i = 0; i < 6; i++) {
+    this.spawnTimer = 1.2;
+    const initialCount = this.isDay ? 5 : 2;
+    for (let i = 0; i < initialCount; i++) {
       if (!this.spawnOne(near)) break;
     }
   }
@@ -183,6 +184,7 @@ export class MobManager {
     delta: number,
     playerPos: THREE.Vector3,
     isDay: boolean,
+    isPlayerFlying: boolean = false,
     onPlayerHit?: (damage: number, source: string) => void
   ) {
     this.onPlayerHit = onPlayerHit;
@@ -195,12 +197,14 @@ export class MobManager {
 
     const dt = Math.min(delta, 0.05);
 
-    // Ambient spawning up to the phase cap.
+    // Ambient spawning up to the phase cap (spawns nocturnes espacés et limités).
     const cap = this.isDay ? this.maxPassive : this.maxHostile;
     this.spawnTimer -= dt;
     if (this.spawnTimer <= 0 && this.mobs.length < cap) {
       this.spawnOne(playerPos);
-      this.spawnTimer = 1.6 + Math.random() * 2.4;
+      this.spawnTimer = this.isDay
+        ? 2.0 + Math.random() * 3.0
+        : 5.0 + Math.random() * 5.0;
     }
 
     // Drop mobs that wandered too far from the player.
@@ -212,7 +216,7 @@ export class MobManager {
     }
 
     for (let i = this.mobs.length - 1; i >= 0; i--) {
-      if (!this.updateMob(this.mobs[i], dt, playerPos)) {
+      if (!this.updateMob(this.mobs[i], dt, playerPos, isPlayerFlying)) {
         this.removeMob(i);
       }
     }
@@ -232,7 +236,12 @@ export class MobManager {
   // Simulation
   // ---------------------------------------------------------------------------
 
-  private updateMob(mob: Mob, dt: number, playerPos: THREE.Vector3): boolean {
+  private updateMob(
+    mob: Mob,
+    dt: number,
+    playerPos: THREE.Vector3,
+    isPlayerFlying: boolean = false
+  ): boolean {
     const stats = MOB_STATS[mob.type];
 
     // If a block was placed inside the mob, lift it out; give up if truly buried.
@@ -271,14 +280,22 @@ export class MobManager {
     const toPlayerZ = playerPos.z - mob.pos.z;
     const distToPlayerSq = toPlayerX * toPlayerX + toPlayerZ * toPlayerZ;
     const dy = playerPos.y - mob.pos.y;
+    const dist3DSq = distToPlayerSq + dy * dy;
 
     // Les corps doivent se chevaucher verticalement pour qu'il y ait contact :
-    // un joueur en l'air (vol, pilier, corniche) reste hors de portée.
-    const inVerticalContact = mobTouchesPlayer(mob.pos.y, stats.height, playerPos.y);
+    // un joueur en l'air (vol, pilier, corniche) reste totalement hors de portée.
+    const inVerticalContact =
+      !isPlayerFlying && mobTouchesPlayer(mob.pos.y, stats.height, playerPos.y);
 
     // Hostile mobs hunt the player and strike when close.
+    // Si le joueur est en vol, il est totalement ignoré par les monstres.
     let chasing = false;
-    if (stats.hostile && distToPlayerSq < 14 * 14 && isWithinChaseHeight(dy)) {
+    if (
+      !isPlayerFlying &&
+      stats.hostile &&
+      distToPlayerSq < 10 * 10 &&
+      isWithinChaseHeight(dy)
+    ) {
       chasing = true;
       mob.idle = false;
       mob.wanderTimer = Math.max(mob.wanderTimer, 0.5);
@@ -288,8 +305,16 @@ export class MobManager {
     }
 
     mob.attackCooldown = Math.max(0, mob.attackCooldown - dt);
-    if (chasing && inVerticalContact && distToPlayerSq < 2.1 * 2.1 && mob.attackCooldown === 0) {
-      mob.attackCooldown = 1.2;
+    // Attaque uniquement si le joueur est au sol à proximité immédiate (mêlée stricte 3D).
+    if (
+      !isPlayerFlying &&
+      chasing &&
+      inVerticalContact &&
+      dist3DSq < 1.8 * 1.8 &&
+      Math.abs(dy) <= 1.2 &&
+      mob.attackCooldown === 0
+    ) {
+      mob.attackCooldown = 1.6;
       this.onPlayerHit?.(stats.damage, stats.name);
     }
 

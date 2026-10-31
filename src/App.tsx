@@ -232,6 +232,7 @@ export default function App() {
     // Damage from mobs
     renderer.onPlayerHit = (damage, source) => {
       if (gameModeRef.current !== 'survival') return;
+      if (physics.isFlying) return;
       healthRef.current = Math.max(0, healthRef.current - damage);
       setHealth(healthRef.current);
       setDamageFlash(Date.now());

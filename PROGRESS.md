@@ -71,7 +71,8 @@ Ce document recense l'état d'avancement du développement de **VoxelCraft 3D**,
 
 ### 6. Entités & Mobs (Monstres et Animaux)
 - [x] **Faune diurne passive** : Cochons et vaches vaquant paisiblement de jour.
-- [x] **Monstres nocturnes hostiles** : Zombies et squelettes apparaissant à la tombée de la nuit, traquant le joueur et l'attaquant au corps à corps.
+- [x] **Monstres nocturnes hostiles équilibrés** : Zombies et squelettes apparaissant à la tombée de la nuit en quantité modérée (max 4 hostiles), dégâts atténués (1 PV / demi-cœur).
+- [x] **Mêlée 3D stricte & immunité en vol** : Poursuite et attaques limitées à la proximité immédiate au sol ; aucun monstre ne peut toucher ou poursuivre un joueur en vol ou situé en hauteur.
 - [x] **Barres de vie flottantes** : Affichage 3D au-dessus de chaque créature actualisé à chaque impact.
 - [x] **Système de combat** : Dégâts calculés selon l'arme tenue (bonus pour les épées), impulsion de recul (*knockback*) et flash visuel de dégât.
 
@@ -161,3 +162,4 @@ Ce document recense l'état d'avancement du développement de **VoxelCraft 3D**,
 - Synthèse sonore 100% procédurale Web Audio API sans aucun asset audio externe.
 - Textures procédurales Canvas 2D 16×16 avec style pixel-art rétro.
 - Mode de construction créatif avec inventaire modal, vol libre et sélection rapide.
+
