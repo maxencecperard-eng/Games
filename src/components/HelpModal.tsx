@@ -17,7 +17,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 font-sans">
+    <div data-game-ui="" className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 font-sans">
       <div className="relative w-full max-w-lg rounded-xl border border-neutral-700 bg-neutral-900 p-6 text-white shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-neutral-800 pb-4">
@@ -108,6 +108,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({
               <li><strong className="text-neutral-200">Dynamite TNT :</strong> Posez un bloc de TNT puis tapez dessus au clic gauche pour allumer la mèche et admirer l'explosion !</li>
               <li><strong className="text-neutral-200">Mode Créatif :</strong> Volez à travers le monde, posez des blocs à l'infini et explorez à votre guise.</li>
               <li><strong className="text-neutral-200">Annuler / Rétablir :</strong> Utilisez Ctrl+Z pour annuler une erreur de construction.</li>
+              <li><strong className="text-neutral-200">Créatures :</strong> Cochons et vaches paissent le jour ; zombies et squelettes rôdent la nuit. Elles se déplacent seules et contournent les obstacles.</li>
             </ul>
           </div>
         </div>

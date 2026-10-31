@@ -57,7 +57,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 font-sans">
+    <div data-game-ui="" className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 font-sans">
       <div className="relative w-full max-w-xl rounded-xl border border-neutral-700 bg-neutral-900 p-6 text-white shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-neutral-800 pb-4">
@@ -83,7 +83,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 { id: 'hills', label: '🌿 Monde Multi-Biomes', desc: 'Montagnes, plages, îles & grottes' },
                 { id: 'flat', label: '🟩 Monde Plat', desc: 'Surface lisse pour bâtir' },
                 { id: 'castle', label: '🏰 Château Fort', desc: 'Tours, murailles & maison' },
-                { id: 'desert', label: '🏜️ Désert & Pyramide', desc: 'Dunes & temple ancien' },
+                { id: 'desert', label: '🏜️ Désert', desc: 'Dunes dorées & falaises de grès' },
                 { id: 'floating', label: '☁️ Îles Volantes', desc: 'Archipel céleste' },
               ].map((p) => (
                 <button

@@ -13,6 +13,8 @@ import {
   HelpCircle,
   Volume2,
   VolumeX,
+  Hammer,
+  BookOpen,
 } from 'lucide-react';
 
 interface ControlDockProps {
@@ -21,6 +23,8 @@ interface ControlDockProps {
   onOpenInventory: () => void;
   onOpenSettings: () => void;
   onOpenHelp: () => void;
+  onOpenCrafting: () => void;
+  onOpenIndex: () => void;
   onUndo: () => void;
   onRedo: () => void;
   canUndo: boolean;
@@ -41,6 +45,8 @@ export const ControlDock: React.FC<ControlDockProps> = ({
   onOpenInventory,
   onOpenSettings,
   onOpenHelp,
+  onOpenCrafting,
+  onOpenIndex,
   onUndo,
   onRedo,
   canUndo,
@@ -56,6 +62,7 @@ export const ControlDock: React.FC<ControlDockProps> = ({
 }) => {
   return (
     <div
+      data-game-ui=""
       className={`fixed left-1/2 z-30 transition-transform duration-300 ease-in-out -translate-x-1/2 ${
         collapsed ? 'translate-y-[calc(100%-28px)]' : 'translate-y-0'
       }`}
@@ -135,6 +142,32 @@ export const ControlDock: React.FC<ControlDockProps> = ({
         >
           <Package size={14} className="text-emerald-400" />
           <span>Inventaire [E]</span>
+        </button>
+
+        {/* 3b. Crafting (C) */}
+        <button
+          onClick={() => {
+            soundEngine.playUIClick();
+            onOpenCrafting();
+          }}
+          className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-neutral-700 bg-neutral-800 px-2.5 py-1.5 text-xs font-semibold text-amber-200 transition-colors hover:bg-neutral-700"
+          title="Fabriquer armes et outils [C]"
+        >
+          <Hammer size={14} />
+          <span>Fabriquer [C]</span>
+        </button>
+
+        {/* 3c. Block index (I) */}
+        <button
+          onClick={() => {
+            soundEngine.playUIClick();
+            onOpenIndex();
+          }}
+          className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-neutral-700 bg-neutral-800 px-2.5 py-1.5 text-xs font-semibold text-purple-200 transition-colors hover:bg-neutral-700"
+          title="Index de tous les blocs et leur rareté [I]"
+        >
+          <BookOpen size={14} />
+          <span>Index [I]</span>
         </button>
 
         {/* Divider */}

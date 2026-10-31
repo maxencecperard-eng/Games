@@ -1,6 +1,30 @@
-import { BlockType, WorldPreset, WorldAction, BLOCK_REGISTRY, BiomeType } from './types';
+import {
+  BlockType,
+  BiomeType,
+  WorldPreset,
+  WorldAction,
+  BLOCK_REGISTRY,
+  BLOCK_IDS,
+  ID_TO_BLOCK,
+} from './types';
 
-// 2D Perlin-like value noise with permutation table
+// ---------------------------------------------------------------------------
+// Constantes du monde
+// ---------------------------------------------------------------------------
+
+export const CHUNK_SIZE = 16;
+/** Le monde descend désormais très profond (couches supplémentaires). */
+export const WORLD_MIN_Y = -64;
+export const WORLD_MAX_Y = 128;
+export const WORLD_HEIGHT = WORLD_MAX_Y - WORLD_MIN_Y;
+export const SEA_LEVEL = 20;
+
+const CHUNK_AREA = CHUNK_SIZE * CHUNK_SIZE;
+
+// ---------------------------------------------------------------------------
+// Bruit 2D / 3D déterministe
+// ---------------------------------------------------------------------------
+
 class Noise2D {
   private perm: number[] = [];
 
@@ -48,7 +72,7 @@ class Noise2D {
 
     const x1 = this.lerp(this.grad(aa, xf, yf), this.grad(ba, xf - 1, yf), u);
     const x2 = this.lerp(this.grad(ab, xf, yf - 1), this.grad(bb, xf - 1, yf - 1), u);
-    return (this.lerp(x1, x2, v) + 1) / 2; // normalized 0..1
+    return (this.lerp(x1, x2, v) + 1) / 2;
   }
 
   public octaveNoise(x: number, y: number, octaves = 3, persistence = 0.5): number {
@@ -66,47 +90,250 @@ class Noise2D {
   }
 }
 
-export class VoxelWorld {
-  // Greatly expanded map size and height depth
-  public width = 88;
-  public depth = 88;
-  public height = 64;
-  public seaLevel = 20;
+class Noise3D {
+  private perm: number[];
 
-  private blocks: Map<string, BlockType> = new Map();
+  constructor(seed = 4242) {
+    this.perm = new Array(512);
+    let s = seed | 0;
+    const p: number[] = [];
+    for (let i = 0; i < 256; i++) p[i] = i;
+    for (let i = 255; i > 0; i--) {
+      s = (s * 16807 + 11) % 2147483647;
+      const j = s % (i + 1);
+      [p[i], p[j]] = [p[j], p[i]];
+    }
+    for (let i = 0; i < 512; i++) this.perm[i] = p[i & 255];
+  }
+
+  private fade(t: number) {
+    return t * t * (3 - 2 * t);
+  }
+
+  private value(ix: number, iy: number, iz: number): number {
+    const h = this.perm[(this.perm[(this.perm[ix & 255] + (iy & 255)) & 255] + (iz & 255)) & 255];
+    return h / 255;
+  }
+
+  public noise(x: number, y: number, z: number): number {
+    const xi = Math.floor(x);
+    const yi = Math.floor(y);
+    const zi = Math.floor(z);
+    const xf = this.fade(x - xi);
+    const yf = this.fade(y - yi);
+    const zf = this.fade(z - zi);
+
+    const c000 = this.value(xi, yi, zi);
+    const c100 = this.value(xi + 1, yi, zi);
+    const c010 = this.value(xi, yi + 1, zi);
+    const c110 = this.value(xi + 1, yi + 1, zi);
+    const c001 = this.value(xi, yi, zi + 1);
+    const c101 = this.value(xi + 1, yi, zi + 1);
+    const c011 = this.value(xi, yi + 1, zi + 1);
+    const c111 = this.value(xi + 1, yi + 1, zi + 1);
+
+    const x00 = c000 + (c100 - c000) * xf;
+    const x10 = c010 + (c110 - c010) * xf;
+    const x01 = c001 + (c101 - c001) * xf;
+    const x11 = c011 + (c111 - c011) * xf;
+    const y0 = x00 + (x10 - x00) * yf;
+    const y1 = x01 + (x11 - x01) * yf;
+    return y0 + (y1 - y0) * zf;
+  }
+}
+
+/** Hash déterministe 3D renvoyant une valeur 0..1. */
+function hash3(x: number, y: number, z: number, seed: number): number {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(z | 0, 2246822519) ^ seed;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h = h ^ (h >>> 16);
+  return (h >>> 0) / 4294967296;
+}
+
+function hash2(x: number, z: number, seed: number): number {
+  return hash3(x, 0, z, seed);
+}
+
+// ---------------------------------------------------------------------------
+// Chunks
+// ---------------------------------------------------------------------------
+
+interface Chunk {
+  cx: number;
+  cz: number;
+  blocks: Uint16Array;
+  /** Hauteur du bloc plein le plus haut de chaque colonne (pour le rendu). */
+  topY: Int16Array;
+  loadedBlocks: number;
+}
+
+export interface ChunkPos {
+  cx: number;
+  cz: number;
+}
+
+export class VoxelWorld {
+  public seed = 1337;
+  public preset: WorldPreset = 'hills';
+  public seaLevel = SEA_LEVEL;
+  public readonly minY = WORLD_MIN_Y;
+  public readonly maxY = WORLD_MAX_Y;
+  /** Conservé pour compatibilité avec l'ancien code (monde infini). */
+  public get height() {
+    return WORLD_MAX_Y;
+  }
+  public get width() {
+    return Infinity;
+  }
+  public get depth() {
+    return Infinity;
+  }
+
+  private chunks: Map<string, Chunk> = new Map();
+  /** Modifications du joueur, persistées et ré-appliquées à la génération. */
+  private edits: Map<string, BlockType> = new Map();
+  private editsByChunk: Map<string, Map<string, BlockType>> = new Map();
   private undoStack: WorldAction[] = [];
   private redoStack: WorldAction[] = [];
-  public onWorldChange?: () => void;
 
   private noiseTerrain = new Noise2D(42);
   private noiseBiome = new Noise2D(999);
   private noiseMountain = new Noise2D(777);
+  private noiseCave = new Noise3D(2024);
 
-  constructor() {
-    this.generatePreset('hills');
+  private loadedBlockCount = 0;
+
+  /** Appelé quand un chunk (ou son voisin) doit être reconstruit. */
+  public onChunkDirty?: (cx: number, cz: number) => void;
+  /** Appelé après une régénération / un import complet. */
+  public onWorldChange?: () => void;
+
+  constructor(preset: WorldPreset = 'hills', seed = Math.floor(Math.random() * 100000)) {
+    this.reset(preset, seed);
   }
 
-  private getKey(x: number, y: number, z: number): string {
+  // -------------------------------------------------------------------------
+  // Accès de base
+  // -------------------------------------------------------------------------
+
+  private chunkKey(cx: number, cz: number): string {
+    return `${cx},${cz}`;
+  }
+
+  private blockKey(x: number, y: number, z: number): string {
     return `${x},${y},${z}`;
   }
 
+  private chunkCoordOf(v: number): number {
+    return Math.floor(v / CHUNK_SIZE);
+  }
+
+  private localIndex(x: number, y: number, z: number): number {
+    const lx = x - this.chunkCoordOf(x) * CHUNK_SIZE;
+    const lz = z - this.chunkCoordOf(z) * CHUNK_SIZE;
+    return (y - WORLD_MIN_Y) * CHUNK_AREA + lz * CHUNK_SIZE + lx;
+  }
+
+  public getChunk(cx: number, cz: number, generate = true): Chunk | null {
+    const key = this.chunkKey(cx, cz);
+    let chunk = this.chunks.get(key);
+    if (!chunk && generate) {
+      chunk = this.createChunk(cx, cz);
+    }
+    return chunk ?? null;
+  }
+
+  public isChunkLoaded(cx: number, cz: number): boolean {
+    return this.chunks.has(this.chunkKey(cx, cz));
+  }
+
+  public getLoadedChunkCount(): number {
+    return this.chunks.size;
+  }
+
+  public getLoadedBlockCount(): number {
+    return this.loadedBlockCount;
+  }
+
+  public getChunkTopY(cx: number, cz: number): Int16Array | null {
+    return this.getChunk(cx, cz, false)?.topY ?? null;
+  }
+
+  public getChunkBlocks(cx: number, cz: number): Uint16Array | null {
+    return this.getChunk(cx, cz, false)?.blocks ?? null;
+  }
+
   public getBlock(x: number, y: number, z: number): BlockType {
-    if (y < 0 || y >= this.height) return 'air';
-    return this.blocks.get(this.getKey(x, y, z)) || 'air';
+    if (y < WORLD_MIN_Y || y >= WORLD_MAX_Y) return 'air';
+    const chunk = this.getChunk(this.chunkCoordOf(x), this.chunkCoordOf(z), true);
+    if (!chunk) return 'air';
+    return ID_TO_BLOCK[chunk.blocks[this.localIndex(x, y, z)]] ?? 'air';
+  }
+
+  /** Comme getBlock mais ne génère jamais de chunk (renvoie 'air' sinon). */
+  public peekBlock(x: number, y: number, z: number): BlockType {
+    if (y < WORLD_MIN_Y || y >= WORLD_MAX_Y) return 'air';
+    const chunk = this.getChunk(this.chunkCoordOf(x), this.chunkCoordOf(z), false);
+    if (!chunk) return 'air';
+    return ID_TO_BLOCK[chunk.blocks[this.localIndex(x, y, z)]] ?? 'air';
+  }
+
+  private writeRaw(x: number, y: number, z: number, type: BlockType): boolean {
+    if (y < WORLD_MIN_Y || y >= WORLD_MAX_Y) return false;
+    const cx = this.chunkCoordOf(x);
+    const cz = this.chunkCoordOf(z);
+    const chunk = this.getChunk(cx, cz, true);
+    if (!chunk) return false;
+
+    const idx = this.localIndex(x, y, z);
+    const prev = ID_TO_BLOCK[chunk.blocks[idx]] ?? 'air';
+    if (prev === type) return false;
+
+    const id = BLOCK_IDS[type] ?? 0;
+    chunk.blocks[idx] = id;
+    if (prev === 'air' && type !== 'air') this.loadedBlockCount++;
+    if (prev !== 'air' && type === 'air') this.loadedBlockCount--;
+
+    if (type !== 'air') {
+      // Met à jour la hauteur maximale de la colonne.
+      const lx = x - cx * CHUNK_SIZE;
+      const lz = z - cz * CHUNK_SIZE;
+      const col = lz * CHUNK_SIZE + lx;
+      if (y > chunk.topY[col]) chunk.topY[col] = y;
+    } else {
+      const lx = x - cx * CHUNK_SIZE;
+      const lz = z - cz * CHUNK_SIZE;
+      const col = lz * CHUNK_SIZE + lx;
+      if (chunk.topY[col] === y) {
+        let ny = y - 1;
+        while (ny >= WORLD_MIN_Y && ID_TO_BLOCK[chunk.blocks[this.localIndex(x, ny, z)]] === 'air') ny--;
+        chunk.topY[col] = ny;
+      }
+    }
+
+    return true;
   }
 
   public setBlock(x: number, y: number, z: number, type: BlockType, recordUndo = true): boolean {
-    if (y < 0 || y >= this.height) return false;
-    const key = this.getKey(x, y, z);
+    if (y < WORLD_MIN_Y || y >= WORLD_MAX_Y) return false;
     const prev = this.getBlock(x, y, z);
-
     if (prev === type) return false;
 
-    if (type === 'air') {
-      this.blocks.delete(key);
-    } else {
-      this.blocks.set(key, type);
+    const cx = this.chunkCoordOf(x);
+    const cz = this.chunkCoordOf(z);
+
+    this.writeRaw(x, y, z, type);
+
+    // Persistance (l'air est conservé pour que les trous restent des trous).
+    const key = this.blockKey(x, y, z);
+    this.edits.set(key, type);
+    const ck = this.chunkKey(cx, cz);
+    let map = this.editsByChunk.get(ck);
+    if (!map) {
+      map = new Map();
+      this.editsByChunk.set(ck, map);
     }
+    map.set(key, type);
 
     if (recordUndo) {
       this.undoStack.push({
@@ -117,496 +344,446 @@ export class VoxelWorld {
         previousBlock: prev,
         newBlock: type,
       });
+      if (this.undoStack.length > 400) this.undoStack.shift();
       this.redoStack = [];
     }
 
-    this.onWorldChange?.();
+    this.markDirtyAt(x, z);
     return true;
+  }
+
+  /** Le maillage d'un chunk dépend aussi des chunks voisins (faces cachées). */
+  private markDirtyAt(x: number, z: number) {
+    if (!this.onChunkDirty) return;
+    const cx = this.chunkCoordOf(x);
+    const cz = this.chunkCoordOf(z);
+    const lx = x - cx * CHUNK_SIZE;
+    const lz = z - cz * CHUNK_SIZE;
+
+    this.onChunkDirty(cx, cz);
+    if (lx === 0) this.onChunkDirty(cx - 1, cz);
+    if (lx === CHUNK_SIZE - 1) this.onChunkDirty(cx + 1, cz);
+    if (lz === 0) this.onChunkDirty(cx, cz - 1);
+    if (lz === CHUNK_SIZE - 1) this.onChunkDirty(cx, cz + 1);
+    if (lx === 0 && lz === 0) this.onChunkDirty(cx - 1, cz - 1);
+    if (lx === 0 && lz === CHUNK_SIZE - 1) this.onChunkDirty(cx - 1, cz + 1);
+    if (lx === CHUNK_SIZE - 1 && lz === 0) this.onChunkDirty(cx + 1, cz - 1);
+    if (lx === CHUNK_SIZE - 1 && lz === CHUNK_SIZE - 1) this.onChunkDirty(cx + 1, cz + 1);
   }
 
   public undo(): boolean {
     const action = this.undoStack.pop();
     if (!action) return false;
-    const key = this.getKey(action.x, action.y, action.z);
-    if (action.previousBlock === 'air') {
-      this.blocks.delete(key);
-    } else {
-      this.blocks.set(key, action.previousBlock);
-    }
+    this.applyEdit(action.x, action.y, action.z, action.previousBlock);
     this.redoStack.push(action);
-    this.onWorldChange?.();
     return true;
   }
 
   public redo(): boolean {
     const action = this.redoStack.pop();
     if (!action) return false;
-    const key = this.getKey(action.x, action.y, action.z);
-    if (action.newBlock === 'air') {
-      this.blocks.delete(key);
-    } else {
-      this.blocks.set(key, action.newBlock);
-    }
+    this.applyEdit(action.x, action.y, action.z, action.newBlock);
     this.undoStack.push(action);
-    this.onWorldChange?.();
     return true;
   }
 
-  public canUndo(): boolean {
+  private applyEdit(x: number, y: number, z: number, type: BlockType) {
+    this.writeRaw(x, y, z, type);
+    const key = this.blockKey(x, y, z);
+    const cx = this.chunkCoordOf(x);
+    const cz = this.chunkCoordOf(z);
+    this.edits.set(key, type);
+    const ck = this.chunkKey(cx, cz);
+    let map = this.editsByChunk.get(ck);
+    if (!map) {
+      map = new Map();
+      this.editsByChunk.set(ck, map);
+    }
+    map.set(key, type);
+    this.markDirtyAt(x, z);
+  }
+
+  public canUndo() {
     return this.undoStack.length > 0;
   }
 
-  public canRedo(): boolean {
+  public canRedo() {
     return this.redoStack.length > 0;
   }
 
-  public getAllBlocks(): Map<string, BlockType> {
-    return this.blocks;
-  }
+  // -------------------------------------------------------------------------
+  // Régénération / preset
+  // -------------------------------------------------------------------------
 
-  public clear() {
-    this.blocks.clear();
+  public reset(preset: WorldPreset, seed: number) {
+    this.preset = preset;
+    this.seed = Math.floor(seed) || 1;
+    this.chunks.clear();
+    this.edits.clear();
+    this.editsByChunk.clear();
     this.undoStack = [];
     this.redoStack = [];
-  }
+    this.loadedBlockCount = 0;
 
-  // Determine biome type at coordinates (x, z)
-  public getBiomeAt(x: number, z: number): BiomeType {
-    // 1. Check for Island Region in north-west ocean quadrant
-    const distIsland1 = Math.sqrt((x - 26) * (x - 26) + (z + 24) * (z + 24));
-    const distIsland2 = Math.sqrt((x + 28) * (x + 28) + (z + 26) * (z + 26));
-    if (distIsland1 < 14 || distIsland2 < 12) {
-      return 'island';
-    }
-
-    // 2. High Mountains in North / North-East
-    const mountainFactor = this.noiseMountain.octaveNoise(x * 0.03, z * 0.03, 3, 0.5);
-    const northWeight = (-z + 20) / 40; // higher toward -z
-    if (northWeight > 0.4 && mountainFactor > 0.45) {
-      return 'mountains';
-    }
-
-    // 3. Desert in South-East
-    const tempNoise = this.noiseBiome.octaveNoise(x * 0.025 + 50, z * 0.025 + 50, 2);
-    if (x > 10 && z > 5 && tempNoise > 0.5) {
-      return 'desert';
-    }
-
-    // 4. Beach or Ocean check based on height
-    const baseH = this.calculateTerrainHeight(x, z);
-    if (baseH < this.seaLevel) {
-      return 'ocean';
-    }
-    if (baseH <= this.seaLevel + 2) {
-      return 'beach';
-    }
-
-    // 5. Forest vs Plains
-    const forestNoise = this.noiseBiome.noise(x * 0.05, z * 0.05);
-    if (forestNoise > 0.48) {
-      return 'forest';
-    }
-    return 'plains';
-  }
-
-  // Calculate terrain surface height at (x, z)
-  private calculateTerrainHeight(x: number, z: number): number {
-    const halfW = this.width / 2;
-    const halfD = this.depth / 2;
-
-    // Edge falloff toward world perimeter to create clean natural shores
-    const edgeDistX = Math.min(x + halfW, halfW - x) / halfW;
-    const edgeDistZ = Math.min(z + halfD, halfD - z) / halfD;
-    const edgeFalloff = Math.min(1, Math.min(edgeDistX, edgeDistZ) * 2.8);
-
-    // Island shapes
-    const distIsland1 = Math.sqrt((x - 26) * (x - 26) + (z + 24) * (z + 24));
-    const distIsland2 = Math.sqrt((x + 28) * (x + 28) + (z + 26) * (z + 26));
-
-    if (distIsland1 < 14) {
-      const islT = (1 - distIsland1 / 14);
-      return Math.floor(this.seaLevel + 1 + islT * 7 + this.noiseTerrain.noise(x * 0.1, z * 0.1) * 3);
-    }
-    if (distIsland2 < 12) {
-      const islT = (1 - distIsland2 / 12);
-      return Math.floor(this.seaLevel + 1 + islT * 6 + this.noiseTerrain.noise(x * 0.1, z * 0.1) * 3);
-    }
-
-    // Mountain peak region (North / North-East)
-    const mtnNoise = this.noiseMountain.octaveNoise(x * 0.025, z * 0.025, 4, 0.55);
-    const isNorth = (-z + 20) / 44; // 0..1 in north
-    let mtnBoost = 0;
-    if (isNorth > 0.2) {
-      // Steep ridges
-      const ridge = 1 - Math.abs(mtnNoise * 2 - 1);
-      mtnBoost = Math.pow(ridge, 1.8) * 32 * Math.min(1, isNorth * 1.5);
-    }
-
-    // Rolling continental hills
-    const continent = this.noiseTerrain.octaveNoise(x * 0.035, z * 0.035, 3, 0.5);
-    const detail = this.noiseTerrain.noise(x * 0.1, z * 0.1) * 3;
-
-    let height = this.seaLevel - 4 + continent * 14 + detail + mtnBoost;
-
-    // Apply perimeter falloff
-    height = this.seaLevel + (height - this.seaLevel) * edgeFalloff;
-
-    return Math.floor(Math.max(4, Math.min(this.height - 4, height)));
-  }
-
-  // Generate World Presets
-  public generatePreset(preset: WorldPreset, seed = Math.floor(Math.random() * 10000)) {
-    this.clear();
-    this.noiseTerrain = new Noise2D(seed);
-    this.noiseBiome = new Noise2D(seed + 101);
-    this.noiseMountain = new Noise2D(seed + 202);
-
-    const halfW = Math.floor(this.width / 2);
-    const halfD = Math.floor(this.depth / 2);
-
-    if (preset === 'hills') {
-      // 🌿 GRAND MONDE MULTI-BIOMES
-      // (Montagnes enneigées, plages dorées, océan profond, îles côtières, forêts denses et désert)
-
-      for (let x = -halfW; x < halfW; x++) {
-        for (let z = -halfD; z < halfD; z++) {
-          const height = this.calculateTerrainHeight(x, z);
-          const biome = this.getBiomeAt(x, z);
-
-          // 1. Bedrock foundation layer (y = 0..2) with jagged teeth
-          this.blocks.set(this.getKey(x, 0, z), 'bedrock');
-          if (Math.sin(x * 7 + z * 13) > 0.2) {
-            this.blocks.set(this.getKey(x, 1, z), 'bedrock');
-          }
-          if (Math.sin(x * 19 + z * 31) > 0.6) {
-            this.blocks.set(this.getKey(x, 2, z), 'bedrock');
-          }
-
-          // 2. Deep Underground Crust (y = 1..18): Stone with rich diamond, gold, iron ores and caves
-          for (let y = 1; y < Math.min(height - 4, 18); y++) {
-            if (this.getBlock(x, y, z) === 'bedrock') continue;
-
-            // Cavern voids in deep underground
-            const caveHollow = Math.sin(x * 0.2 + y * 0.4 + z * 0.2) * Math.cos(x * 0.15 + z * 0.15);
-            if (caveHollow > 0.85 && y > 3 && y < height - 6) {
-              continue; // cave air pocket!
-            }
-
-            const oreSeed = Math.sin(x * 37.1 + y * 91.7 + z * 53.3);
-            let b: BlockType = 'stone';
-
-            if (y <= 12 && oreSeed > 0.89) {
-              b = 'diamond_ore';
-            } else if (y <= 18 && oreSeed > 0.81) {
-              b = 'gold_ore';
-            } else if (oreSeed > 0.72) {
-              b = 'iron_ore';
-            }
-            this.blocks.set(this.getKey(x, y, z), b);
-          }
-
-          // 3. Upper Underground Crust (y = 18 to height-4)
-          for (let y = 18; y < height - 4; y++) {
-            const oreSeed = Math.sin(x * 29.3 + y * 71.1 + z * 41.9);
-            let b: BlockType = 'stone';
-            if (oreSeed > 0.76) b = 'iron_ore';
-            if (oreSeed > 0.92 && y < 28) b = 'gold_ore';
-            this.blocks.set(this.getKey(x, y, z), b);
-          }
-
-          // 4. Biome-Specific Sub-layer and Top-layer
-          if (biome === 'mountains') {
-            // Mountain peak biome
-            for (let y = Math.max(1, height - 4); y < height; y++) {
-              this.blocks.set(this.getKey(x, y, z), 'stone');
-            }
-            // Snow crown above y >= 40, Ice seams, Stone crags below
-            if (height >= 42) {
-              this.blocks.set(this.getKey(x, height, z), 'snow');
-              // Snow cap depth
-              if (height >= 46) {
-                this.blocks.set(this.getKey(x, height - 1, z), 'snow');
-              }
-            } else if (height >= 34) {
-              // Crag stone / gravel
-              this.blocks.set(this.getKey(x, height, z), Math.sin(x * 3 + z * 5) > 0.3 ? 'gravel' : 'stone');
-            } else {
-              this.blocks.set(this.getKey(x, height, z), 'grass');
-            }
-          } else if (biome === 'desert') {
-            // Warm desert with sandstone base and sand dunes
-            for (let y = Math.max(1, height - 5); y < height - 1; y++) {
-              this.blocks.set(this.getKey(x, y, z), 'sandstone');
-            }
-            this.blocks.set(this.getKey(x, height - 1, z), 'sand');
-            this.blocks.set(this.getKey(x, height, z), 'sand');
-          } else if (biome === 'beach') {
-            // Golden sandy beach near water
-            for (let y = Math.max(1, height - 3); y < height; y++) {
-              this.blocks.set(this.getKey(x, y, z), 'sandstone');
-            }
-            this.blocks.set(this.getKey(x, height, z), 'sand');
-          } else if (biome === 'ocean') {
-            // Deep Ocean floor (gravel / sand)
-            this.blocks.set(this.getKey(x, height, z), Math.sin(x * 5 + z * 7) > 0 ? 'gravel' : 'sand');
-            // Water volume up to sea level
-            for (let y = height + 1; y <= this.seaLevel; y++) {
-              this.blocks.set(this.getKey(x, y, z), 'water');
-            }
-          } else if (biome === 'island') {
-            // Tropical Island with sandy rim and lush interior
-            const isRim = height <= this.seaLevel + 1;
-            for (let y = Math.max(1, height - 3); y < height; y++) {
-              this.blocks.set(this.getKey(x, y, z), isRim ? 'sandstone' : 'dirt');
-            }
-            this.blocks.set(this.getKey(x, height, z), isRim ? 'sand' : 'grass');
-          } else {
-            // Plains & Forest
-            for (let y = Math.max(1, height - 3); y < height; y++) {
-              this.blocks.set(this.getKey(x, y, z), 'dirt');
-            }
-            this.blocks.set(this.getKey(x, height, z), 'grass');
-          }
-
-          // Ensure any depressions below seaLevel are filled with water
-          if (height < this.seaLevel && biome !== 'ocean') {
-            for (let y = height + 1; y <= this.seaLevel; y++) {
-              this.blocks.set(this.getKey(x, y, z), 'water');
-            }
-          }
-        }
-      }
-
-      // Plant lush procedural vegetation across Forest, Plains & Islands
-      const treeCount = 48;
-      let planted = 0;
-      for (let attempt = 0; attempt < 500 && planted < treeCount; attempt++) {
-        const tx = Math.floor((Math.random() - 0.5) * (this.width - 16));
-        const tz = Math.floor((Math.random() - 0.5) * (this.depth - 16));
-        const biome = this.getBiomeAt(tx, tz);
-
-        if (biome === 'forest' || biome === 'plains' || biome === 'island') {
-          // Find surface height
-          let gy = -1;
-          for (let y = this.height - 1; y >= this.seaLevel; y--) {
-            const b = this.getBlock(tx, y, tz);
-            if (b === 'grass' || (biome === 'island' && b === 'sand')) {
-              gy = y;
-              break;
-            }
-          }
-
-          if (gy > this.seaLevel) {
-            this.spawnTree(tx, gy + 1, tz);
-            planted++;
-          }
-        }
-      }
-    } else if (preset === 'flat') {
-      // Superflat étendu (Bedrock y=0, 18 couches de pierre/terre, herbe au-dessus)
-      for (let x = -halfW; x < halfW; x++) {
-        for (let z = -halfD; z < halfD; z++) {
-          this.blocks.set(this.getKey(x, 0, z), 'bedrock');
-          for (let y = 1; y < 16; y++) {
-            this.blocks.set(this.getKey(x, y, z), 'stone');
-          }
-          this.blocks.set(this.getKey(x, 16, z), 'dirt');
-          this.blocks.set(this.getKey(x, 17, z), 'dirt');
-          this.blocks.set(this.getKey(x, 18, z), 'grass');
-        }
-      }
-    } else if (preset === 'floating') {
-      // Archipel d'îles volantes étendu avec étagement vertical
-      for (let x = -halfW; x < halfW; x++) {
-        for (let z = -halfD; z < halfD; z++) {
-          const dist = Math.sqrt(x * x + z * z);
-          if (dist > 38) continue;
-
-          const n = this.noiseTerrain.octaveNoise(x * 0.06, z * 0.06, 3, 0.5);
-          const islandHeight = Math.floor(34 + n * 12);
-          const islandDepth = Math.max(1, Math.floor((1 - dist / 38) * 10));
-
-          for (let d = 0; d < islandDepth; d++) {
-            const y = islandHeight - d;
-            if (d === 0) {
-              this.blocks.set(this.getKey(x, y, z), 'grass');
-            } else if (d <= 3) {
-              this.blocks.set(this.getKey(x, y, z), 'dirt');
-            } else {
-              this.blocks.set(this.getKey(x, y, z), 'stone');
-            }
-          }
-        }
-      }
-      this.spawnTree(0, 42, 0);
-      this.spawnTree(-12, 38, 10);
-      this.spawnTree(14, 40, -8);
-      this.spawnTree(-8, 36, -14);
-      this.spawnTree(16, 39, 12);
-    } else if (preset === 'castle') {
-      // Château médiéval imposant avec douves d'eau, murailles crénelées et 4 donjons
-      for (let x = -halfW; x < halfW; x++) {
-        for (let z = -halfD; z < halfD; z++) {
-          this.blocks.set(this.getKey(x, 0, z), 'bedrock');
-          for (let y = 1; y < 14; y++) {
-            this.blocks.set(this.getKey(x, y, z), 'stone');
-          }
-          this.blocks.set(this.getKey(x, 14, z), 'dirt');
-          this.blocks.set(this.getKey(x, 15, z), 'dirt');
-          this.blocks.set(this.getKey(x, 16, z), 'grass');
-        }
-      }
-
-      // Douves d'eau autour du château (rayon 16 à 19)
-      for (let x = -20; x <= 20; x++) {
-        for (let z = -20; z <= 20; z++) {
-          const r = Math.max(Math.abs(x), Math.abs(z));
-          if (r >= 16 && r <= 19) {
-            // Pont-levis au sud (z entre 16 et 19, |x| <= 2)
-            if (z >= 16 && Math.abs(x) <= 2) {
-              this.blocks.set(this.getKey(x, 16, z), 'planks');
-            } else {
-              this.blocks.set(this.getKey(x, 16, z), 'water');
-              this.blocks.set(this.getKey(x, 15, z), 'water');
-            }
-          }
-        }
-      }
-
-      // Murailles extérieures de la forteresse (14x14)
-      const radius = 13;
-      for (let x = -radius; x <= radius; x++) {
-        for (let z = -radius; z <= radius; z++) {
-          const isEdge = Math.abs(x) === radius || Math.abs(z) === radius;
-          if (isEdge) {
-            if (z === radius && Math.abs(x) <= 2) continue; // porte sud
-            for (let y = 17; y <= 24; y++) {
-              this.blocks.set(this.getKey(x, y, z), 'cobblestone');
-            }
-            if ((x + z) % 2 === 0) {
-              this.blocks.set(this.getKey(x, 25, z), 'stone');
-            }
-          }
-        }
-      }
-
-      // 4 Donjons imposants aux angles
-      const towers = [
-        [-radius, -radius],
-        [radius, -radius],
-        [-radius, radius],
-        [radius, radius],
-      ];
-      for (const [cx, cz] of towers) {
-        for (let dx = -2; dx <= 2; dx++) {
-          for (let dz = -2; dz <= 2; dz++) {
-            for (let y = 17; y <= 30; y++) {
-              const isWall = Math.abs(dx) === 2 || Math.abs(dz) === 2;
-              if (isWall || y === 30) {
-                this.blocks.set(this.getKey(cx + dx, y, cz + dz), 'brick');
-              }
-            }
-            // Créneaux de tour
-            if (Math.abs(dx) === 2 || Math.abs(dz) === 2) {
-              if ((dx + dz) % 2 === 0) {
-                this.blocks.set(this.getKey(cx + dx, 31, cz + dz), 'cobblestone');
-              }
-            }
-          }
-        }
-        // Pierre lumineuse au sommet
-        this.blocks.set(this.getKey(cx, 30, cz), 'glowstone');
-      }
-
-      // Logis seigneurial dans la cour
-      for (let x = -5; x <= 5; x++) {
-        for (let z = -6; z <= -1; z++) {
-          this.blocks.set(this.getKey(x, 16, z), 'cobblestone');
-          const isHouseEdge = x === -5 || x === 5 || z === -6 || z === -1;
-          if (isHouseEdge) {
-            for (let y = 17; y <= 22; y++) {
-              if (y === 19 && (x === 0 || z === -4)) {
-                this.blocks.set(this.getKey(x, y, z), 'glass');
-              } else {
-                this.blocks.set(this.getKey(x, y, z), 'planks');
-              }
-            }
-          }
-          this.blocks.set(this.getKey(x, 23, z), 'wood');
-        }
-      }
-      this.blocks.set(this.getKey(-3, 17, -4), 'crafting_table');
-      this.blocks.set(this.getKey(-3, 17, -3), 'bookshelf');
-      this.blocks.set(this.getKey(-3, 18, -3), 'bookshelf');
-      this.blocks.set(this.getKey(3, 17, -4), 'glowstone');
-    } else if (preset === 'desert') {
-      // Grand désert avec dunes ondulantes et Grande Pyramide à degrés
-      for (let x = -halfW; x < halfW; x++) {
-        for (let z = -halfD; z < halfD; z++) {
-          this.blocks.set(this.getKey(x, 0, z), 'bedrock');
-          const n = this.noiseTerrain.octaveNoise(x * 0.03, z * 0.03, 3, 0.4);
-          const duneHeight = Math.floor(16 + n * 10);
-
-          for (let y = 1; y < duneHeight - 4; y++) {
-            this.blocks.set(this.getKey(x, y, z), 'stone');
-          }
-          for (let y = duneHeight - 4; y < duneHeight; y++) {
-            this.blocks.set(this.getKey(x, y, z), 'sandstone');
-          }
-          this.blocks.set(this.getKey(x, duneHeight, z), 'sand');
-        }
-      }
-
-      // Grande Pyramide à degrés
-      const baseR = 14;
-      for (let tier = 0; tier <= baseR; tier++) {
-        const r = baseR - tier;
-        const y = 20 + tier;
-        for (let x = -r; x <= r; x++) {
-          for (let z = -r; z <= r; z++) {
-            const isChamber = tier >= 1 && tier <= 5 && Math.abs(x) <= 3 && Math.abs(z) <= 3;
-            if (isChamber) {
-              if (tier === 1 && x === 0 && z === 0) {
-                this.blocks.set(this.getKey(x, y, z), 'gold_ore');
-              } else if (tier === 1 && (Math.abs(x) === 1 || Math.abs(z) === 1)) {
-                this.blocks.set(this.getKey(x, y, z), 'diamond_ore');
-              }
-            } else {
-              this.blocks.set(this.getKey(x, y, z), tier % 2 === 0 ? 'sandstone' : 'sand');
-            }
-          }
-        }
-      }
-      this.blocks.set(this.getKey(0, 20 + baseR + 1, 0), 'glowstone');
-    }
+    this.noiseTerrain = new Noise2D(this.seed);
+    this.noiseBiome = new Noise2D(this.seed + 101);
+    this.noiseMountain = new Noise2D(this.seed + 202);
+    this.noiseCave = new Noise3D(this.seed + 303);
 
     this.onWorldChange?.();
   }
 
-  // Spawn an oak tree
-  private spawnTree(x: number, startY: number, z: number) {
-    const trunkHeight = 5 + Math.floor(Math.random() * 2);
+  public generatePreset(preset: WorldPreset, seed = Math.floor(Math.random() * 100000)) {
+    this.reset(preset, seed);
+  }
 
-    for (let y = 0; y < trunkHeight; y++) {
-      this.blocks.set(this.getKey(x, startY + y, z), 'wood');
+  // -------------------------------------------------------------------------
+  // Biome & relief
+  // -------------------------------------------------------------------------
+
+  public calculateTerrainHeight(x: number, z: number): number {
+    if (this.preset === 'flat' || this.preset === 'castle') return SEA_LEVEL;
+
+    const continent = this.noiseTerrain.octaveNoise(x * 0.006, z * 0.006, 4, 0.5);
+    let height = SEA_LEVEL + 3 + (continent - 0.5) * 38;
+
+    // Chaînes de montagnes
+    const ridgeNoise = this.noiseMountain.octaveNoise(x * 0.005 + 100, z * 0.005, 3, 0.55);
+    if (ridgeNoise > 0.52) {
+      const ridge = 1 - Math.abs(ridgeNoise * 2 - 1);
+      height += Math.pow(ridge, 1.6) * 62 * (ridgeNoise - 0.52) * 4;
     }
 
-    const leafBase = startY + trunkHeight - 2;
-    for (let ly = leafBase; ly <= startY + trunkHeight + 1; ly++) {
-      const radius = ly >= startY + trunkHeight ? 1 : 2;
-      for (let lx = -radius; lx <= radius; lx++) {
-        for (let lz = -radius; lz <= radius; lz++) {
-          if (Math.abs(lx) === radius && Math.abs(lz) === radius && Math.random() > 0.4) continue;
-          const k = this.getKey(x + lx, ly, z + lz);
-          if (!this.blocks.has(k) || this.blocks.get(k) === 'air') {
-            this.blocks.set(k, 'leaves');
+    // Dunes de désert (évaluées directement pour éviter toute récursion)
+    const temp = this.noiseBiome.octaveNoise(x * 0.0035 + 40, z * 0.0035 + 40, 2, 0.5);
+    if (this.preset === 'desert' || temp > 0.57) {
+      const dune = this.noiseTerrain.octaveNoise(x * 0.03 + 10, z * 0.03, 3, 0.45);
+      height += dune * 5 - 2;
+    }
+
+    const detail = (this.noiseTerrain.noise(x * 0.12, z * 0.12) - 0.5) * 3;
+    height += detail;
+
+    return Math.floor(Math.max(WORLD_MIN_Y + 6, Math.min(WORLD_MAX_Y - 8, height)));
+  }
+
+  public getBiomeAt(x: number, z: number): BiomeType {
+    if (this.preset === 'desert') return 'desert';
+    if (this.preset === 'flat') return 'plains';
+    if (this.preset === 'castle') return 'plains';
+
+    const h = this.calculateTerrainHeight(x, z);
+
+    if (h >= 56) return 'mountains';
+    if (h < SEA_LEVEL - 1) {
+      return h > SEA_LEVEL - 6 ? 'island' : 'ocean';
+    }
+    if (h <= SEA_LEVEL + 1) return 'beach';
+
+    const temp = this.noiseBiome.octaveNoise(x * 0.0035 + 40, z * 0.0035 + 40, 2, 0.5);
+    if (temp > 0.57) return 'desert';
+
+    const forest = this.noiseBiome.octaveNoise(x * 0.008, z * 0.008, 2, 0.5);
+    return forest > 0.5 ? 'forest' : 'plains';
+  }
+
+  // -------------------------------------------------------------------------
+  // Génération de chunk
+  // -------------------------------------------------------------------------
+
+  private createChunk(cx: number, cz: number): Chunk {
+    const chunk: Chunk = {
+      cx,
+      cz,
+      blocks: new Uint16Array(CHUNK_AREA * WORLD_HEIGHT),
+      topY: new Int16Array(CHUNK_AREA).fill(WORLD_MIN_Y - 1),
+      loadedBlocks: 0,
+    };
+
+    this.generateTerrain(chunk);
+    this.plantTrees(chunk);
+    this.applySavedEdits(chunk);
+    this.recountChunk(chunk);
+
+    this.chunks.set(this.chunkKey(cx, cz), chunk);
+    this.loadedBlockCount += chunk.loadedBlocks;
+    return chunk;
+  }
+
+  private recountChunk(chunk: Chunk) {
+    let count = 0;
+    for (let i = 0; i < chunk.blocks.length; i++) if (chunk.blocks[i] !== 0) count++;
+    chunk.loadedBlocks = count;
+  }
+
+  private setLocal(chunk: Chunk, x: number, y: number, z: number, type: BlockType) {
+    if (y < WORLD_MIN_Y || y >= WORLD_MAX_Y) return;
+    const lx = x - chunk.cx * CHUNK_SIZE;
+    const lz = z - chunk.cz * CHUNK_SIZE;
+    if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) return;
+    const idx = (y - WORLD_MIN_Y) * CHUNK_AREA + lz * CHUNK_SIZE + lx;
+    chunk.blocks[idx] = BLOCK_IDS[type] ?? 0;
+    const col = lz * CHUNK_SIZE + lx;
+    if (type !== 'air' && y > chunk.topY[col]) chunk.topY[col] = y;
+  }
+
+  private generateTerrain(chunk: Chunk) {
+    const ox = chunk.cx * CHUNK_SIZE;
+    const oz = chunk.cz * CHUNK_SIZE;
+    const isFlat = this.preset === 'flat' || this.preset === 'castle';
+
+    for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+      for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+        const x = ox + lx;
+        const z = oz + lz;
+        const height = this.calculateTerrainHeight(x, z);
+        const biome = this.getBiomeAt(x, z);
+
+        // Fondation indestructible
+        for (let y = WORLD_MIN_Y; y <= WORLD_MIN_Y + 2; y++) {
+          this.setLocal(chunk, x, y, z, 'bedrock');
+        }
+        if (hash3(x, 0, z, this.seed) > 0.55) {
+          this.setLocal(chunk, x, WORLD_MIN_Y + 3, z, 'bedrock');
+        }
+
+        const soilDepth = biome === 'desert' ? 4 : 3;
+
+        for (let y = WORLD_MIN_Y + 3; y <= height; y++) {
+          if (y === WORLD_MIN_Y + 3) {
+            this.setLocal(chunk, x, y, z, 'stone');
+            continue;
+          }
+
+          const depth = height - y;
+          let block: BlockType = 'stone';
+
+          if (depth <= soilDepth) {
+            if (biome === 'desert' || biome === 'beach') {
+              block = depth <= 1 ? 'sand' : 'sandstone';
+            } else if (biome === 'ocean') {
+              block = depth === 0 ? (hash3(x, y, z, 7) > 0.5 ? 'gravel' : 'sand') : 'stone';
+            } else if (biome === 'mountains') {
+              block = height >= 52 && depth === 0 ? 'snow' : 'stone';
+            } else {
+              block = depth === 0 ? 'grass' : 'dirt';
+            }
+          }
+
+          this.setLocal(chunk, x, y, z, block);
+
+          // Minage : filons de minerais par profondeur
+          if (block === 'stone') {
+            const ore = this.oreAt(x, y, z, biome);
+            if (ore) this.setLocal(chunk, x, y, z, ore);
+          }
+        }
+
+        // Grottes (uniquement sous la surface, jamais dans le bedrock)
+        if (!isFlat) {
+          const caveTop = height - 3;
+          for (let y = WORLD_MIN_Y + 4; y <= caveTop; y++) {
+            const n = this.noiseCave.noise(x * 0.075, y * 0.11, z * 0.075);
+            const tunnel = Math.abs(n - 0.5) < 0.028;
+            const cavern = n > 0.68;
+            if (tunnel || cavern) {
+              this.setLocal(chunk, x, y, z, 'air');
+            }
+          }
+        }
+
+        // Océans, mers et plages
+        if (height < SEA_LEVEL && biome !== 'desert') {
+          for (let y = height + 1; y <= SEA_LEVEL; y++) {
+            this.setLocal(chunk, x, y, z, 'water');
+          }
+        }
+
+        // Îles flottantes du preset dédié
+        if (this.preset === 'floating') {
+          const n = this.noiseTerrain.octaveNoise(x * 0.02 + 300, z * 0.02, 3, 0.5);
+          if (n > 0.6) {
+            const islandTop = 58 + Math.floor((n - 0.6) * 60);
+            for (let d = 0; d < 4; d++) {
+              const y = islandTop - d;
+              this.setLocal(chunk, x, y, z, d === 0 ? 'grass' : d <= 1 ? 'dirt' : 'stone');
+            }
+          }
+        }
+
+        // Château du preset "castle"
+        if (this.preset === 'castle') {
+          this.buildCastleColumn(chunk, x, z, height);
+        }
+      }
+    }
+  }
+
+  private oreAt(x: number, y: number, z: number, biome: BiomeType): BlockType | null {
+    const r = hash3(x, y, z, this.seed + 17);
+    if (y < 8 && r < 0.0016) return 'diamond_ore';
+    if (y < 16 && r < 0.0035) return 'redstone_ore';
+    if (y < 30 && r < 0.006) return 'gold_ore';
+    if (y < 56 && r < 0.013) return 'iron_ore';
+    if (y < 90 && r < 0.024) return 'coal_ore';
+    if (biome === 'mountains' && y > 20 && y < 70 && hash3(x, y, z, this.seed + 71) < 0.0022) {
+      return 'emerald_ore';
+    }
+    return null;
+  }
+
+  private buildCastleColumn(chunk: Chunk, x: number, z: number, ground: number) {
+    // Le château est construit autour de l'origine, sur un terrain plat.
+    const r = Math.max(Math.abs(x), Math.abs(z));
+    if (r > 20) return;
+
+    // Douves
+    if (r >= 16 && r <= 19) {
+      const isBridge = z >= 16 && Math.abs(x) <= 2;
+      if (!isBridge) this.setLocal(chunk, x, ground, z, 'water');
+      else this.setLocal(chunk, x, ground, z, 'planks');
+    }
+
+    // Muraille 13x13
+    if (r === 13) {
+      const isGate = z === 13 && Math.abs(x) <= 2;
+      if (!isGate) {
+        for (let y = ground + 1; y <= ground + 8; y++) {
+          this.setLocal(chunk, x, y, z, 'cobblestone');
+        }
+        if ((x + z) % 2 === 0) this.setLocal(chunk, x, ground + 9, z, 'stone');
+      }
+    }
+
+    // Donjons d'angle
+    const corners = [
+      [-13, -13],
+      [13, -13],
+      [-13, 13],
+      [13, 13],
+    ];
+    for (const [cx, cz] of corners) {
+      const dx = x - cx;
+      const dz = z - cz;
+      if (Math.abs(dx) <= 2 && Math.abs(dz) <= 2) {
+        const isWall = Math.abs(dx) === 2 || Math.abs(dz) === 2;
+        for (let y = ground + 1; y <= ground + 14; y++) {
+          if (isWall || y === ground + 14) this.setLocal(chunk, x, y, z, 'brick');
+        }
+        if (Math.abs(dx) === 2 || Math.abs(dz) === 2) {
+          if ((dx + dz) % 2 === 0) this.setLocal(chunk, x, ground + 15, z, 'cobblestone');
+        }
+        if (dx === 0 && dz === 0) this.setLocal(chunk, x, ground + 14, z, 'glowstone');
+      }
+    }
+
+    // Logis seigneurial
+    if (x >= -5 && x <= 5 && z >= -6 && z <= -1) {
+      this.setLocal(chunk, x, ground, z, 'cobblestone');
+      const isHouseEdge = x === -5 || x === 5 || z === -6 || z === -1;
+      if (isHouseEdge) {
+        for (let y = ground + 1; y <= ground + 6; y++) {
+          if (y === ground + 3 && (x === 0 || z === -4)) {
+            this.setLocal(chunk, x, y, z, 'glass');
+          } else {
+            this.setLocal(chunk, x, y, z, 'planks');
+          }
+        }
+      }
+      this.setLocal(chunk, x, ground + 7, z, 'wood');
+    }
+    if (x === -3 && z === -4) this.setLocal(chunk, x, ground + 1, z, 'crafting_table');
+    if (x === -3 && z === -3) {
+      this.setLocal(chunk, x, ground + 1, z, 'bookshelf');
+      this.setLocal(chunk, x, ground + 2, z, 'bookshelf');
+    }
+    if (x === 3 && z === -4) this.setLocal(chunk, x, ground + 1, z, 'glowstone');
+  }
+
+  // -------------------------------------------------------------------------
+  // Arbres
+  // -------------------------------------------------------------------------
+
+  private plantTrees(chunk: Chunk) {
+    const margin = 3;
+    const ox = chunk.cx * CHUNK_SIZE;
+    const oz = chunk.cz * CHUNK_SIZE;
+
+    for (let x = ox - margin; x < ox + CHUNK_SIZE + margin; x++) {
+      for (let z = oz - margin; z < oz + CHUNK_SIZE + margin; z++) {
+        const biome = this.getBiomeAt(x, z);
+        if (biome !== 'forest' && biome !== 'plains' && biome !== 'island') continue;
+        const density = biome === 'forest' ? 0.028 : biome === 'plains' ? 0.006 : 0.012;
+        if (hash2(x, z, this.seed + 900) > density) continue;
+
+        const ground = this.calculateTerrainHeight(x, z);
+        if (ground <= SEA_LEVEL + 1) continue;
+
+        const trunk = 4 + Math.floor(hash2(x, z, this.seed + 901) * 3);
+        for (let y = 1; y <= trunk; y++) {
+          this.setLocal(chunk, x, ground + y, z, 'wood');
+        }
+
+        const leafBase = ground + trunk - 2;
+        for (let ly = leafBase; ly <= ground + trunk + 1; ly++) {
+          const radius = ly >= ground + trunk ? 1 : 2;
+          for (let lx = -radius; lx <= radius; lx++) {
+            for (let lz = -radius; lz <= radius; lz++) {
+              if (Math.abs(lx) === radius && Math.abs(lz) === radius) {
+                if (hash2(x + lx, z + lz, this.seed + 902) > 0.4) continue;
+              }
+              const idx = this.localIndexOf(chunk, x + lx, ly, z + lz);
+              if (idx < 0) continue;
+              if (chunk.blocks[idx] === 0) {
+                chunk.blocks[idx] = BLOCK_IDS.leaves;
+                const col = (z + lz - chunk.cz * CHUNK_SIZE) * CHUNK_SIZE + (x + lx - chunk.cx * CHUNK_SIZE);
+                if (ly > chunk.topY[col]) chunk.topY[col] = ly;
+              }
+            }
           }
         }
       }
     }
   }
 
-  public explodeTNT(x: number, y: number, z: number, radius = 3.8): { x: number; y: number; z: number; type: BlockType }[] {
+  private localIndexOf(chunk: Chunk, x: number, y: number, z: number): number {
+    if (y < WORLD_MIN_Y || y >= WORLD_MAX_Y) return -1;
+    const lx = x - chunk.cx * CHUNK_SIZE;
+    const lz = z - chunk.cz * CHUNK_SIZE;
+    if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) return -1;
+    return (y - WORLD_MIN_Y) * CHUNK_AREA + lz * CHUNK_SIZE + lx;
+  }
+
+  // -------------------------------------------------------------------------
+  // Persistance & édition
+  // -------------------------------------------------------------------------
+
+  private applySavedEdits(chunk: Chunk) {
+    const map = this.editsByChunk.get(this.chunkKey(chunk.cx, chunk.cz));
+    if (!map) return;
+    for (const [key, type] of map.entries()) {
+      const [x, y, z] = key.split(',').map(Number);
+      this.setLocal(chunk, x, y, z, type);
+    }
+  }
+
+  public getSurfaceY(x: number, z: number): number {
+    // Cherche le premier bloc solide en partant du haut (inclut les arbres).
+    for (let y = WORLD_MAX_Y - 1; y >= WORLD_MIN_Y; y--) {
+      const b = this.getBlock(x, y, z);
+      if (b !== 'air' && b !== 'water' && b !== 'leaves' && b !== 'wood') {
+        return y;
+      }
+    }
+    return WORLD_MIN_Y;
+  }
+
+  public explodeTNT(
+    x: number,
+    y: number,
+    z: number,
+    radius = 3.8
+  ): { x: number; y: number; z: number; type: BlockType }[] {
     const destroyed: { x: number; y: number; z: number; type: BlockType }[] = [];
     const rInt = Math.ceil(radius);
 
@@ -614,49 +791,64 @@ export class VoxelWorld {
       for (let dy = -rInt; dy <= rInt; dy++) {
         for (let dz = -rInt; dz <= rInt; dz++) {
           const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-          if (dist <= radius) {
-            const bx = x + dx;
-            const by = y + dy;
-            const bz = z + dz;
-            const block = this.getBlock(bx, by, bz);
-            if (block !== 'air' && block !== 'bedrock' && block !== 'obsidian') {
-              destroyed.push({ x: bx, y: by, z: bz, type: block });
-              this.setBlock(bx, by, bz, 'air', false);
-            }
+          if (dist > radius) continue;
+          const bx = x + dx;
+          const by = y + dy;
+          const bz = z + dz;
+          const block = this.getBlock(bx, by, bz);
+          if (block !== 'air' && block !== 'bedrock' && block !== 'obsidian' && block !== 'water') {
+            destroyed.push({ x: bx, y: by, z: bz, type: block });
+            this.setBlock(bx, by, bz, 'air', false);
           }
         }
       }
     }
-
-    this.onWorldChange?.();
     return destroyed;
   }
 
   public exportJSON(): string {
-    const blockList: { x: number; y: number; z: number; type: BlockType }[] = [];
-    for (const [key, type] of this.blocks.entries()) {
+    const editList: { x: number; y: number; z: number; type: BlockType }[] = [];
+    for (const [key, type] of this.edits.entries()) {
       const [x, y, z] = key.split(',').map(Number);
-      blockList.push({ x, y, z, type });
+      editList.push({ x, y, z, type });
     }
     return JSON.stringify({
-      version: 2,
-      width: this.width,
-      depth: this.depth,
-      height: this.height,
-      blocks: blockList,
+      version: 3,
+      seed: this.seed,
+      preset: this.preset,
+      minY: WORLD_MIN_Y,
+      maxY: WORLD_MAX_Y,
+      edits: editList,
     });
   }
 
   public importJSON(jsonStr: string): boolean {
     try {
       const data = JSON.parse(jsonStr);
-      if (!data || !Array.isArray(data.blocks)) return false;
-      this.clear();
-      for (const item of data.blocks) {
-        if (item && BLOCK_REGISTRY[item.type as BlockType]) {
-          this.blocks.set(this.getKey(item.x, item.y, item.z), item.type as BlockType);
+      if (!data) return false;
+
+      // Ancien format (v2) : monde fini 88x88x64 → on le convertit en éditions.
+      if (!Array.isArray(data.edits) && Array.isArray(data.blocks)) {
+        this.reset('flat', Math.floor(Math.random() * 100000));
+        for (const item of data.blocks) {
+          if (item && BLOCK_REGISTRY[item.type as BlockType]) {
+            this.setBlock(item.x, item.y, item.z, item.type as BlockType, false);
+          }
         }
+        this.onWorldChange?.();
+        return true;
       }
+
+      if (!Array.isArray(data.edits)) return false;
+
+      const preset = (data.preset as WorldPreset) || 'hills';
+      this.reset(preset, Number(data.seed) || 1);
+
+      for (const item of data.edits) {
+        if (!item || !BLOCK_REGISTRY[item.type as BlockType]) continue;
+        this.setBlock(item.x, item.y, item.z, item.type as BlockType, false);
+      }
+
       this.onWorldChange?.();
       return true;
     } catch {
@@ -664,7 +856,7 @@ export class VoxelWorld {
     }
   }
 
-  public saveToLocalStorage(key = 'voxelcraft_saved_world') {
+  public saveToLocalStorage(key = 'voxelcraft_saved_world'): boolean {
     try {
       localStorage.setItem(key, this.exportJSON());
       return true;
@@ -680,6 +872,19 @@ export class VoxelWorld {
       return this.importJSON(raw);
     } catch {
       return false;
+    }
+  }
+
+  /** Libère les chunks trop éloignés pour garder la mémoire sous contrôle. */
+  public unloadFarChunks(centerX: number, centerZ: number, maxChunkDistance: number) {
+    const ccx = this.chunkCoordOf(centerX);
+    const ccz = this.chunkCoordOf(centerZ);
+    for (const [key, chunk] of this.chunks.entries()) {
+      const dist = Math.max(Math.abs(chunk.cx - ccx), Math.abs(chunk.cz - ccz));
+      if (dist > maxChunkDistance) {
+        this.loadedBlockCount -= chunk.loadedBlocks;
+        this.chunks.delete(key);
+      }
     }
   }
 }

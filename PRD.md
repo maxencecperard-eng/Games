@@ -35,13 +35,14 @@ Permettre à tout utilisateur d'accéder instantanément, depuis n'importe quel 
 ## 3. Spécifications Fonctionnelles Détaillées
 
 ### 3.1 Moteur Voxel & Gestion de l'Univers (FS-1)
-- **Structure de Données** : Grille spatiale 3D discrète stockée sous forme de table de hachage associant des coordonnées `(x, y, z)` à un identifiant `BlockType`.
-- **Dimensions Étendues** : Dimensions horizontales de **88×88 blocs** (de -44 à +43 en X et Z, soit 7 744 colonnes) et **64 couches en hauteur** (y = 0 à 63).
+- **Structure de Données** : Monde **infini par chunks** de $16\times16$ colonnes, chaque chunk stockant ses blocs dans un `Uint16Array` indexé par identifiant `BlockType`, avec un tableau de hauteurs par colonne pour le rendu.
+- **Dimensions** : Étendue horizontale infinie ; **192 couches en hauteur** ($y = -64$ à $127$), niveau de la mer à $y = 20$.
+- **Chargement Dynamique** : Génération à la demande autour du joueur (rayon de 4 chunks) et déchargement des chunks éloignés pour maîtriser mémoire et framerate.
 - **Couches Géologiques & Sous-Sol Profond** :
-  - *Fondation Bedrock* : Plancher impénétrable aux reliefs déchiquetés à $y = 0\dots2$.
-  - *Sous-sol Profond ($y = 1\dots18$)* : Roche dense criblée de filons de diamants, d'or, de cavités et cavernes naturelles.
-  - *Niveau de la Mer* : Établi à $y = 20$.
-  - *Sommets Montagneux* : Cimes culminant jusqu'à $y = 58$ coiffées de neige.
+  - *Fondation Bedrock* : Plancher impénétrable aux reliefs déchiquetés à $y = -64\dots-61$.
+  - *Sous-sol Profond* : Roche dense criblée de filons de charbon, fer, or, redstone, diamants, émeraudes, de cavités et cavernes naturelles.
+  - *Sommets Montagneux* : Cimes coiffées de neige, bien au-dessus du niveau de la mer.
+- **Persistance Sparse** : Seules les modifications du joueur sont sauvegardées (graine + preset + éditions), schéma `version: 3` ; les anciennes sauvegardes v2 sont converties.
 - **Système d'Annulation / Rétablissement** : Pile d'historique complète enregistrant chaque bloc posé ou détruit, accessible via `Ctrl+Z` et `Ctrl+Y`.
 
 ### 3.2 Générateur de Textures Procédurales (FS-2)
@@ -90,16 +91,20 @@ Permettre à tout utilisateur d'accéder instantanément, depuis n'importe quel 
 ### 3.8 Interface Utilisateur & HUD (FS-8)
 - **Viseur Central** : Croix pixelisée classique blanche avec ombre portée.
 - **Barre d'Accès Rapide (Hotbar)** : 9 emplacements numérotés avec icônes pixel-art, contour de sélection actif et infobulle éphémère du nom de l'objet.
-- **Indicateurs de Survie** : 10 cœurs de santé et 10 cuisses de nourriture affichés uniquement en mode Survie.
-- **Inventaire Créatif Modal (`E`)** : Grille scrollable de tous les blocs disponibles avec filtre textuel instantané et onglets catégoriels (*Tous*, *Nature*, *Construction*, *Minerais*, *Spéciaux*).
-- **Écran de Débogage `F3`** : Télémétrie en temps réel (version, coordonnées XYZ exactes, bloc de grille, orientation boussole et degrés, état de vol, nom du bloc ciblé et total de voxels).
+- **Indicateurs de Survie** : 10 cœurs de santé et 10 cuisses de nourriture, affichés à gauche de la barre d'accès uniquement en mode Survie.
+- **Barre de Minage** : progression du bloc miné sous le réticule, avec le nom du bloc et le pourcentage.
+- **Inventaire Modal (`E`)** : onglets *Possédés*, *Blocs* et *Outils & Armes*, recherche instantanée, rareté colorée et quantités possédées.
+- **Fabrication (`C`)** : interface d'établi animée, recettes verrouillées sans établi à proximité, résultat mis en avant à la fin de l'artisanat.
+- **Index des Blocs (`I`)** : catalogue complet (icône, rareté, dureté, outil et niveau requis, quantité possédée) avec filtre par rareté et recherche.
+- **Vie des Créatures** : barre de vie flottante au-dessus de chaque monstre et animal, mise à jour à chaque coup.
+- **Écran de Débogage `F3`** : télémétrie en temps réel (version, coordonnées XYZ exactes, bloc de grille, biome, orientation boussole et degrés, état de vol, nom du bloc ciblé et total de voxels chargés).
 - **Dock Inférieur Rétractable (`H`)** : Barre d'actions rapides (Changement de mode, bascule de vol, annuler/rétablir, mute son, presets et paramètres) rétractable pour un affichage "Cinéma / Plein écran".
 
 ### 3.9 Presets de Mondes (FS-9)
-1. **Monde Naturel** : Relief vallonné généré par bruit de gradient à 3 octaves, plages de sable, arbres en chêne avec canopée sphérique et filons de charbon/fer/or/diamant.
-2. **Monde Plat** : Base de bedrock à $y=0$, deux couches de terre et couverture d'herbe à $y=3$.
-3. **Château Fort** : Forteresse médiévale de $18\times18$ blocs avec remparts à créneaux, 4 tours d'angle surmontées de lanternes en pierre lumineuse, cour centrale et logis en bois avec fenêtres en verre.
-4. **Désert & Pyramide** : Dunes de sable et temple à 9 étages à degrés renfermant une crypte secrète garnie de filons précieux.
+1. **Monde Naturel** : Relief infini généré par bruit multi-octaves avec biomes (montagnes, plages, océan, forêt, plaines, désert), arbres en chêne, grottes et filons de charbon/fer/or/redstone/diamant/émeraude.
+2. **Monde Plat** : Surface d'herbe au niveau de la mer ($y = 20$), idéale pour de grandes constructions.
+3. **Château Fort** : Forteresse médiévale avec douves, remparts à créneaux, 4 tours d'angle surmontées de pierre lumineuse, cour centrale, logis en bois avec fenêtres en verre et établi de fabrication.
+4. **Désert** : Dunes de sable et falaises de grès à perte de vue.
 5. **Îles Volantes** : Archipel d'îlots flottants avec racines de roche effilées et arbres suspendus.
 
 ### 3.10 Moteur Sonore Procédural (FS-10)
@@ -136,8 +141,11 @@ Permettre à tout utilisateur d'accéder instantanément, depuis n'importe quel 
 
 | ID | En tant que... | Je souhaite... | Afin de... | Critère d'Acceptation |
 | :--- | :--- | :--- | :--- | :--- |
-| **US-01** | Bâtisseur | Poser et détruire des blocs avec précision. | Créer des structures complexes. | Le raycasting met en évidence le bloc visé et le clic pose/détruit immédiatement avec du son et des particules. |
-| **US-02** | Joueur | Choisir n'importe quel bloc dans une bibliothèque. | Ne pas être limité aux 9 blocs de départ. | L'appui sur `E` ouvre l'inventaire avec recherche et permet d'équiper un bloc dans le slot sélectionné. |
+| **US-01** | Bâtisseur | Poser et détruire des blocs avec précision. | Créer des structures complexes. | Le raycasting met en évidence le bloc visé, le clic gauche maintient le minage (durée propre au bloc) et le clic droit pose le bloc avec son et particules. |
+| **US-02** | Joueur | Récolter les blocs que je mine. | Démarrer sans rien et progresser. | En survie, la barre d'accès est vide au départ ; chaque bloc miné avec l'outil adéquat est ajouté à l'inventaire et à la hotbar. |
+| **US-07** | Joueur | Fabriquer des armes et des pioches. | Être plus efficace au combat et au minage. | L'appui sur `C` ouvre l'établi animé ; les recettes d'armes exigent un établi placé à proximité et consomment les ressources. |
+| **US-08** | Joueur | Consulter la rareté et les caractéristiques des blocs. | Savoir ce qui vaut la peine d'être miné. | L'appui sur `I` ouvre l'index complet avec rareté, dureté, outil et niveau de pioche requis, filtrable et cherchable. |
+| **US-09** | Joueur | Combattre les monstres et survivre la nuit. | Avoir un vrai défi de survie. | Chaque créature a une barre de vie ; les zombies/squelettes attaquent la nuit et le joueur dispose de 10 cœurs avec régénération. |
 | **US-03** | Architecte | Voler librement au-dessus du terrain. | Avoir une vue d'ensemble de mon chantier. | L'appui sur `F` ou le bouton de vol libère le joueur de la gravité et permet de monter avec `Espace` et descendre avec `Shift`. |
 | **US-04** | Joueur | Déclencher des explosifs. | Faire des cratères ou miner rapidement. | Un clic sur la TNT allume la mèche qui explose au bout de 3 secondes en soufflant les blocs autour. |
 | **US-05** | Créateur | Sauvegarder mon travail sous forme de fichier. | Reprendre plus tard ou partager ma carte à un ami. | Le bouton "Exporter .json" télécharge un fichier valide qui peut être réimporté fidèlement. |
@@ -192,7 +200,8 @@ Permettre à tout utilisateur d'accéder instantanément, depuis n'importe quel 
 
 ## 7. Perspectives & Évolutions Futures
 
-1. **Génération Infinie de Chunks** : Chargement et déchargement dynamique de tronçons de $16\times16$ blocs autour du joueur.
-2. **Logique Redstone** : Poudre de redstone, répéteurs, leviers et pistons interactifs.
+1. **Génération Infinie de Chunks** : ✅ Implémentée — chargement et déchargement dynamique de tronçons de $16\times16$ blocs autour du joueur.
+2. **Logique Redstone** : Poudre de redstone, répéteurs, leviers et pistons interactifs (les minerais de redstone existent déjà).
 3. **Contrôles Tactiles Avancés** : Joystick virtuel et boutons d'action adaptés aux tablettes et smartphones.
 4. **Multijoueur Peer-to-Peer** : Synchronisation temps réel des positions de joueurs et modifications de monde via WebRTC sans serveur de jeu centralisé.
+5. **Faim & Nourriture** : Consommation des cuisses de faim et aliments (la barre de faim est déjà affichée).

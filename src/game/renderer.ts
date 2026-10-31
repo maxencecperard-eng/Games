@@ -1,18 +1,18 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { VoxelWorld } from './world';
-import { TextureManager } from './textures';
+import { VoxelWorld, CHUNK_SIZE, WORLD_MIN_Y, WORLD_MAX_Y } from './world';
 import { PlayerPhysics } from './physics';
+import { BLOCK_REGISTRY, BlockType, ID_TO_BLOCK } from './types';
+import { TextureManager } from './textures';
 import { ParticleSystem } from './particles';
-import { BlockType, BLOCK_REGISTRY } from './types';
+import { MobManager } from './entities';
 import { soundEngine } from './audio';
+import { ItemId, getItem } from './items';
 
-// Pre-allocated math helpers at module scope to avoid GC spikes in animation loop
-const _vec3 = new THREE.Vector3();
-const _center = new THREE.Vector2(0, 0);
-const _mat4 = new THREE.Matrix4();
 const _dummy = new THREE.Object3D();
+const _mat4 = new THREE.Matrix4();
 const _raycaster = new THREE.Raycaster();
+const _center = new THREE.Vector2(0, 0);
 
 export interface RaycastHit {
   blockPos: { x: number; y: number; z: number };
@@ -21,34 +21,44 @@ export interface RaycastHit {
   faceNormal: THREE.Vector3;
 }
 
+export interface AttackResult {
+  hit: boolean;
+  killed: boolean;
+  name: string;
+  position: THREE.Vector3 | null;
+}
+
 export class GameRenderer {
   public scene: THREE.Scene;
   public camera: THREE.PerspectiveCamera;
   public renderer: THREE.WebGLRenderer;
   public textureManager: TextureManager;
   public particles: ParticleSystem;
+  public mobs: MobManager;
+  public isSoftwareGl: boolean;
 
-  private isSoftwareGl: boolean;
-  private animFrameId: number = 0;
   private isDisposed = false;
+  private animFrameId = 0;
 
-  // Lighting & Sky
-  private dirLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
+  private dirLight: THREE.DirectionalLight;
+
   private sunMesh: THREE.Mesh;
   private moonMesh: THREE.Mesh;
   private skyGroup: THREE.Group;
   private starsMesh: THREE.Points;
   private cloudsMesh: THREE.InstancedMesh;
 
-  // Meshes & Blocks
-  private blockMeshes: Map<BlockType, THREE.InstancedMesh> = new Map();
+  // Meshes & Blocks — un groupe d'InstancedMesh par chunk
+  private chunkMeshes: Map<string, Map<BlockType, THREE.InstancedMesh>> = new Map();
+  private dirtyChunks: Set<string> = new Set();
   private blockBoxGeom: THREE.BoxGeometry;
   private highlightBox: THREE.LineSegments;
 
   // First-person hand
-  private handGroup: THREE.Group;
+  private handAnchor: THREE.Group;
   private handBlockMesh: THREE.Mesh;
+  private handToolGroup: THREE.Group;
   private swingProgress = 0;
   private isSwinging = false;
   private walkBob = 0;
@@ -59,10 +69,16 @@ export class GameRenderer {
   // Day/Night Cycle (0.0: midnight, 0.25: dawn, 0.5: noon, 0.75: dusk)
   public timeOfDay: number = 0.45; // early afternoon
   public dayCycleActive: boolean = true;
-  public dayCycleSpeed: number = 0.005; // ~200s full day cycle
+  public dayCycleSpeed: number = 1 / 360; // 6 min full cycle: 3 min of day, 3 min of night
+  public isDay: boolean = true;
+
+  /** Callback quand un monstre touche le joueur. */
+  public onPlayerHit?: (damage: number, source: string) => void;
 
   // Target block cache
   public currentHit: RaycastHit | null = null;
+
+  private readonly renderRadius = 4;
 
   constructor(
     private container: HTMLElement,
@@ -101,7 +117,7 @@ export class GameRenderer {
       75,
       container.clientWidth / container.clientHeight,
       0.1,
-      240
+      260
     );
 
     // 4. Procedural Studio Environment Reflection
@@ -112,6 +128,7 @@ export class GameRenderer {
     // 5. Initialize Textures and Particles
     this.textureManager = new TextureManager();
     this.particles = new ParticleSystem(this.scene);
+    this.mobs = new MobManager(this.scene, world, !this.isSoftwareGl);
     this.blockBoxGeom = new THREE.BoxGeometry(1, 1, 1);
 
     // 6. Lighting
@@ -137,19 +154,16 @@ export class GameRenderer {
     this.skyGroup = new THREE.Group();
     this.scene.add(this.skyGroup);
 
-    // Sun: Square glowing box
     const sunGeom = new THREE.BoxGeometry(10, 10, 0.8);
     const sunMat = new THREE.MeshBasicMaterial({ color: 0xfffa77 });
     this.sunMesh = new THREE.Mesh(sunGeom, sunMat);
     this.skyGroup.add(this.sunMesh);
 
-    // Moon: Square box
     const moonGeom = new THREE.BoxGeometry(9, 9, 0.8);
     const moonMat = new THREE.MeshBasicMaterial({ color: 0xf4f6f7 });
     this.moonMesh = new THREE.Mesh(moonGeom, moonMat);
     this.skyGroup.add(this.moonMesh);
 
-    // Twinkling Stars
     const starGeom = new THREE.BufferGeometry();
     const starCount = 600;
     const starPositions = new Float32Array(starCount * 3);
@@ -168,7 +182,6 @@ export class GameRenderer {
     );
     this.skyGroup.add(this.starsMesh);
 
-    // Voxel Clouds (altitude 68 above high mountains)
     const cloudGeom = new THREE.BoxGeometry(14, 2.5, 14);
     const cloudMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
@@ -179,7 +192,7 @@ export class GameRenderer {
     for (let i = 0; i < 96; i++) {
       const cx = (i % 12 - 6) * 18 + (Math.random() - 0.5) * 12;
       const cz = (Math.floor(i / 12) - 4) * 18 + (Math.random() - 0.5) * 12;
-      const cy = 68 + Math.sin(i * 3) * 2;
+      const cy = 118 + Math.sin(i * 3) * 2;
       _dummy.position.set(cx, cy, cz);
       _dummy.scale.set(1 + Math.random() * 0.9, 0.8, 1 + Math.random() * 0.9);
       _dummy.updateMatrix();
@@ -195,36 +208,102 @@ export class GameRenderer {
     this.highlightBox.visible = false;
     this.scene.add(this.highlightBox);
 
-    // 9. First-Person Hand holding active block
-    this.handGroup = new THREE.Group();
+    // 9. First-Person Hand
+    this.handAnchor = new THREE.Group();
     const handGeom = new THREE.BoxGeometry(0.35, 0.35, 0.35);
-    const handMat = this.textureManager.getMaterialSet('grass')?.materials || new THREE.MeshStandardMaterial({ color: 0x559933 });
+    const handMat =
+      this.textureManager.getMaterialSet('grass')?.materials ||
+      new THREE.MeshStandardMaterial({ color: 0x559933 });
     this.handBlockMesh = new THREE.Mesh(handGeom, handMat);
-    this.handBlockMesh.position.set(0.42, -0.38, -0.65);
+    this.handToolGroup = new THREE.Group();
+    this.handAnchor.add(this.handBlockMesh);
+    this.handAnchor.add(this.handToolGroup);
+    this.handAnchor.position.set(0.42, -0.38, -0.65);
     this.handBlockMesh.rotation.set(0.3, -0.5, 0.2);
-    this.handGroup.add(this.handBlockMesh);
-    this.camera.add(this.handGroup);
+    this.camera.add(this.handAnchor);
     this.scene.add(this.camera);
 
-    // 10. Rebuild world meshes
-    this.rebuildAllMeshes();
+    // 10. World callbacks & initial chunk meshes
+    this.world.onChunkDirty = (cx, cz) => {
+      this.dirtyChunks.add(`${cx},${cz}`);
+    };
     this.world.onWorldChange = () => {
-      this.rebuildAllMeshes();
+      this.clearChunkMeshes();
+      this.dirtyChunks.clear();
     };
 
-    // 11. Resize handling
+    this.syncChunks(true);
+
+    // 11. Initial creature population around the spawn point
+    this.mobs.reset(this.physics.position);
+
+    // 12. Resize handling
     window.addEventListener('resize', this.onResize);
 
-    // 12. Start animation loop
+    // 13. Start animation loop
     this.startLoop();
   }
 
-  public setHandBlock(blockType: BlockType) {
-    const matSet = this.textureManager.getMaterialSet(blockType);
-    if (matSet) {
-      this.handBlockMesh.material = matSet.materials;
-      this.handBlockMesh.visible = blockType !== 'air';
+  // -------------------------------------------------------------------------
+  // Hand item
+  // -------------------------------------------------------------------------
+
+  public setHandItem(item: ItemId | null) {
+    const config = getItem(item);
+
+    if (!item || !config) {
+      this.handBlockMesh.visible = false;
+      this.handToolGroup.visible = false;
+      return;
     }
+
+    if (config.kind === 'block' && config.block) {
+      const matSet = this.textureManager.getMaterialSet(config.block);
+      if (matSet) this.handBlockMesh.material = matSet.materials;
+      this.handBlockMesh.visible = true;
+      this.handToolGroup.visible = false;
+      return;
+    }
+
+    // Outil / arme : petit modèle voxel
+    this.handBlockMesh.visible = false;
+    this.handToolGroup.visible = true;
+    this.handToolGroup.clear();
+
+    const tierColors: Record<string, string> = {
+      wood: '#b8945f',
+      stone: '#9a9a9a',
+      iron: '#e2e2e2',
+      diamond: '#4dedf4',
+    };
+    const prefix = String(item).split('_')[0];
+    const bladeColor = tierColors[prefix] || '#b8945f';
+
+    const handleMat = new THREE.MeshStandardMaterial({ color: '#6b4a2b', roughness: 0.8 });
+    const bladeMat = new THREE.MeshStandardMaterial({
+      color: bladeColor,
+      roughness: 0.35,
+      metalness: prefix === 'iron' || prefix === 'diamond' ? 0.6 : 0.15,
+    });
+
+    const handle = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.5, 0.07), handleMat);
+    handle.position.set(0, -0.18, 0);
+    handle.rotation.z = 0.25;
+    this.handToolGroup.add(handle);
+
+    if (config.kind === 'weapon') {
+      const blade = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.55, 0.05), bladeMat);
+      blade.position.set(0.09, 0.2, 0);
+      blade.rotation.z = 0.25;
+      this.handToolGroup.add(blade);
+    } else {
+      const head = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.1, 0.1), bladeMat);
+      head.position.set(0.06, 0.12, 0);
+      head.rotation.z = 0.25;
+      this.handToolGroup.add(head);
+    }
+
+    this.handToolGroup.rotation.set(0.3, -0.4, 0.1);
   }
 
   public triggerSwing() {
@@ -233,7 +312,6 @@ export class GameRenderer {
   }
 
   public primeTNT(x: number, y: number, z: number) {
-    // Replace TNT block with primed flashing TNT
     this.world.setBlock(x, y, z, 'air', false);
     soundEngine.playTNTFuse();
 
@@ -243,91 +321,184 @@ export class GameRenderer {
     mesh.position.set(x + 0.5, y + 0.5, z + 0.5);
     this.scene.add(mesh);
 
-    this.primedTNTs.push({
-      mesh,
-      x,
-      y,
-      z,
-      timer: 3.0, // 3 seconds fuse
-    });
+    this.primedTNTs.push({ mesh, x, y, z, timer: 3.0 });
   }
 
-  public rebuildAllMeshes() {
-    // Collect visible blocks grouped by BlockType
-    const blockGroups = new Map<BlockType, { x: number; y: number; z: number }[]>();
-    const allBlocks = this.world.getAllBlocks();
+  // -------------------------------------------------------------------------
+  // Chunk meshes
+  // -------------------------------------------------------------------------
 
-    for (const [key, type] of allBlocks.entries()) {
-      if (type === 'air') continue;
-      const [x, y, z] = key.split(',').map(Number);
+  private chunkKey(cx: number, cz: number) {
+    return `${cx},${cz}`;
+  }
 
-      // Hidden Face Culling: If completely encased by 6 opaque blocks, skip rendering
-      const isEnclosed =
-        this.isOpaque(x + 1, y, z) &&
-        this.isOpaque(x - 1, y, z) &&
-        this.isOpaque(x, y + 1, z) &&
-        this.isOpaque(x, y - 1, z) &&
-        this.isOpaque(x, y, z + 1) &&
-        this.isOpaque(x, y, z - 1);
-
-      if (isEnclosed) continue;
-
-      if (!blockGroups.has(type)) {
-        blockGroups.set(type, []);
-      }
-      blockGroups.get(type)!.push({ x, y, z });
+  private disposeChunkMesh(key: string) {
+    const group = this.chunkMeshes.get(key);
+    if (!group) return;
+    for (const mesh of group.values()) {
+      this.scene.remove(mesh);
+      mesh.dispose();
     }
+    this.chunkMeshes.delete(key);
+  }
 
-    // Update or create InstancedMesh for each type
-    for (const [type, positions] of blockGroups.entries()) {
-      let instMesh = this.blockMeshes.get(type);
-      const count = positions.length;
+  private clearChunkMeshes() {
+    for (const key of Array.from(this.chunkMeshes.keys())) this.disposeChunkMesh(key);
+  }
 
-      if (!instMesh || instMesh.count < count) {
-        if (instMesh) {
-          this.scene.remove(instMesh);
-          instMesh.dispose();
+  /** Charge les chunks visibles et reconstruit ceux marqués comme modifiés. */
+  public syncChunks(force = false) {
+    const pcx = Math.floor(this.physics.position.x / CHUNK_SIZE);
+    const pcz = Math.floor(this.physics.position.z / CHUNK_SIZE);
+    const radius = this.renderRadius;
+    const wanted = new Set<string>();
+
+    for (let dz = -radius; dz <= radius; dz++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        if (dx * dx + dz * dz > (radius + 0.5) * (radius + 0.5)) continue;
+        const cx = pcx + dx;
+        const cz = pcz + dz;
+        const key = this.chunkKey(cx, cz);
+        wanted.add(key);
+        this.world.getChunk(cx, cz, true);
+        if (!this.chunkMeshes.has(key) || this.dirtyChunks.has(key) || force) {
+          this.rebuildChunk(cx, cz);
         }
-        const matSet = this.textureManager.getMaterialSet(type);
-        const mat = matSet ? matSet.materials : new THREE.MeshStandardMaterial({ color: 0x888888 });
-
-        // Allocate buffer with headroom to avoid frequent re-allocations
-        const capacity = Math.max(count + 64, 128);
-        instMesh = new THREE.InstancedMesh(this.blockBoxGeom, mat, capacity);
-        instMesh.castShadow = !this.isSoftwareGl && type !== 'glass' && type !== 'water';
-        instMesh.receiveShadow = !this.isSoftwareGl;
-        instMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        this.scene.add(instMesh);
-        this.blockMeshes.set(type, instMesh);
-      }
-
-      instMesh.count = count;
-      for (let i = 0; i < count; i++) {
-        const p = positions[i];
-        _mat4.makeTranslation(p.x + 0.5, p.y + 0.5, p.z + 0.5);
-        instMesh.setMatrixAt(i, _mat4);
-      }
-      instMesh.instanceMatrix.needsUpdate = true;
-      instMesh.computeBoundingSphere();
-    }
-
-    // Hide any unused instanced meshes
-    for (const [type, instMesh] of this.blockMeshes.entries()) {
-      if (!blockGroups.has(type)) {
-        instMesh.count = 0;
-        instMesh.instanceMatrix.needsUpdate = true;
       }
     }
+
+    this.dirtyChunks.clear();
+
+    for (const key of Array.from(this.chunkMeshes.keys())) {
+      if (!wanted.has(key)) this.disposeChunkMesh(key);
+    }
+
+    // Libère la mémoire des chunks très éloignés.
+    this.world.unloadFarChunks(this.physics.position.x, this.physics.position.z, radius + 5);
   }
 
-  private isOpaque(x: number, y: number, z: number): boolean {
-    const b = this.world.getBlock(x, y, z);
-    if (b === 'air') return false;
-    const cfg = BLOCK_REGISTRY[b];
+  private blockAt(cx: number, cz: number, blocks: Uint16Array, x: number, y: number, z: number): BlockType {
+    if (y < WORLD_MIN_Y || y >= WORLD_MAX_Y) return 'air';
+    const lx = x - cx * CHUNK_SIZE;
+    const lz = z - cz * CHUNK_SIZE;
+    if (lx >= 0 && lx < CHUNK_SIZE && lz >= 0 && lz < CHUNK_SIZE) {
+      return ID_TO_BLOCK[blocks[(y - WORLD_MIN_Y) * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx]] ?? 'air';
+    }
+    return this.world.getBlock(x, y, z);
+  }
+
+  private isOpaqueBlock(type: BlockType): boolean {
+    if (type === 'air') return false;
+    const cfg = BLOCK_REGISTRY[type];
     return !!(cfg && cfg.solid && !cfg.transparent);
   }
 
-  // Update Day / Night cycle colors & sun/moon positions
+  private rebuildChunk(cx: number, cz: number) {
+    const blocks = this.world.getChunkBlocks(cx, cz);
+    const topY = this.world.getChunkTopY(cx, cz);
+    if (!blocks || !topY) return;
+
+    this.disposeChunkMesh(this.chunkKey(cx, cz));
+
+    const groups = new Map<BlockType, number[]>();
+    const ox = cx * CHUNK_SIZE;
+    const oz = cz * CHUNK_SIZE;
+
+    for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        const x = ox + lx;
+        const z = oz + lz;
+        const col = lz * CHUNK_SIZE + lx;
+        const top = Math.min(topY[col], WORLD_MAX_Y - 1);
+
+        for (let y = WORLD_MIN_Y; y <= top; y++) {
+          const idx = (y - WORLD_MIN_Y) * CHUNK_SIZE * CHUNK_SIZE + col;
+          const id = blocks[idx];
+          if (id === 0) continue;
+          const type = ID_TO_BLOCK[id];
+          if (!type) continue;
+
+          // Culling des blocs totalement entourés de blocs opaques.
+          const surrounded =
+            this.isOpaqueBlock(this.blockAt(cx, cz, blocks, x + 1, y, z)) &&
+            this.isOpaqueBlock(this.blockAt(cx, cz, blocks, x - 1, y, z)) &&
+            this.isOpaqueBlock(this.blockAt(cx, cz, blocks, x, y + 1, z)) &&
+            this.isOpaqueBlock(this.blockAt(cx, cz, blocks, x, y - 1, z)) &&
+            this.isOpaqueBlock(this.blockAt(cx, cz, blocks, x, y, z + 1)) &&
+            this.isOpaqueBlock(this.blockAt(cx, cz, blocks, x, y, z - 1));
+          if (surrounded) continue;
+
+          let list = groups.get(type);
+          if (!list) {
+            list = [];
+            groups.set(type, list);
+          }
+          list.push(x, y, z);
+        }
+      }
+    }
+
+    const chunkGroup = new Map<BlockType, THREE.InstancedMesh>();
+
+    for (const [type, positions] of groups.entries()) {
+      const count = positions.length / 3;
+      if (count === 0) continue;
+
+      const matSet = this.textureManager.getMaterialSet(type);
+      const mat = matSet ? matSet.materials : new THREE.MeshStandardMaterial({ color: 0x888888 });
+
+      const capacity = count + 16;
+      const instMesh = new THREE.InstancedMesh(this.blockBoxGeom, mat, capacity);
+      instMesh.castShadow = !this.isSoftwareGl && type !== 'glass' && type !== 'water';
+      instMesh.receiveShadow = !this.isSoftwareGl;
+      instMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      instMesh.frustumCulled = true;
+
+      for (let i = 0; i < count; i++) {
+        _mat4.makeTranslation(positions[i * 3] + 0.5, positions[i * 3 + 1] + 0.5, positions[i * 3 + 2] + 0.5);
+        instMesh.setMatrixAt(i, _mat4);
+      }
+      instMesh.count = count;
+      instMesh.instanceMatrix.needsUpdate = true;
+      instMesh.computeBoundingSphere();
+
+      this.scene.add(instMesh);
+      chunkGroup.set(type, instMesh);
+    }
+
+    this.chunkMeshes.set(this.chunkKey(cx, cz), chunkGroup);
+  }
+
+  public rebuildAllMeshes() {
+    this.syncChunks(true);
+  }
+
+  private activeBlockMeshes(): THREE.InstancedMesh[] {
+    const list: THREE.InstancedMesh[] = [];
+    for (const group of this.chunkMeshes.values()) {
+      for (const mesh of group.values()) {
+        if (mesh.count > 0) list.push(mesh);
+      }
+    }
+    return list;
+  }
+
+  // -------------------------------------------------------------------------
+  // Combat
+  // -------------------------------------------------------------------------
+
+  public tryAttack(damage: number, reach = 4.2): AttackResult {
+    _raycaster.setFromCamera(_center, this.camera);
+    _raycaster.far = reach;
+    const result = this.mobs.hitTest(_raycaster, reach, damage);
+    _raycaster.far = Infinity;
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Day / Night
+  // -------------------------------------------------------------------------
+
   private updateDayNight(delta: number) {
     if (this.dayCycleActive) {
       this.timeOfDay = (this.timeOfDay + delta * this.dayCycleSpeed) % 1.0;
@@ -336,80 +507,69 @@ export class GameRenderer {
     const angle = this.timeOfDay * Math.PI * 2;
     const sunDist = 140;
 
-    // Sun orbit
     const sunX = Math.cos(angle) * sunDist;
     const sunY = Math.sin(angle) * sunDist;
     this.sunMesh.position.set(sunX, sunY, 0);
     this.sunMesh.lookAt(0, 0, 0);
 
-    // Moon opposite to Sun
     this.moonMesh.position.set(-sunX, -sunY, 0);
     this.moonMesh.lookAt(0, 0, 0);
 
-    // Directional light tracks sun position (or moon during night)
-    const isDay = sunY > -5;
+    const isDay = sunY > 0;
+    this.isDay = isDay;
     if (isDay) {
       this.dirLight.position.set(sunX, Math.max(sunY, 10), 20);
       const intensity = Math.max(0.1, Math.min(1.4, (sunY / 30) * 1.4));
       this.dirLight.intensity = intensity;
       this.dirLight.color.setHSL(0.1, 0.4, 0.95);
     } else {
-      // Gentle blue moonlight
       this.dirLight.position.set(-sunX, Math.max(-sunY, 10), 20);
       this.dirLight.intensity = 0.2;
       this.dirLight.color.setHSL(0.6, 0.5, 0.7);
     }
 
-    // Sky & Fog colors
     let skyColor: THREE.Color;
-    let fogDensity = 0.007;
 
     if (sunY > 20) {
-      // Clear daytime cyan
       skyColor = new THREE.Color(0x78a7ff);
     } else if (sunY > 0) {
-      // Golden dawn / sunset
       const t = sunY / 20;
       skyColor = new THREE.Color(0xfd7e14).lerp(new THREE.Color(0x78a7ff), t);
     } else if (sunY > -15) {
-      // Dusk twilight
       const t = (sunY + 15) / 15;
       skyColor = new THREE.Color(0x0d1b2a).lerp(new THREE.Color(0xfd7e14), t);
     } else {
-      // Deep midnight
       skyColor = new THREE.Color(0x060b14);
     }
 
     this.scene.background = skyColor;
-    this.scene.fog = new THREE.FogExp2(skyColor, fogDensity);
+    this.scene.fog = new THREE.FogExp2(skyColor, 0.0075);
     this.hemiLight.color.copy(skyColor);
 
-    // Star visibility
     const starOpacity = Math.max(0, Math.min(1, (-sunY + 5) / 25));
     (this.starsMesh.material as THREE.PointsMaterial).opacity = starOpacity;
     this.starsMesh.visible = starOpacity > 0.05;
 
-    // Drifting clouds
     this.cloudsMesh.position.x += delta * 0.8;
     if (this.cloudsMesh.position.x > 32) this.cloudsMesh.position.x = -32;
+    this.cloudsMesh.position.y = this.physics.position.y + 60;
   }
 
-  // Update raycast from screen center to find targeted voxel
+  // -------------------------------------------------------------------------
+  // Raycast / cible
+  // -------------------------------------------------------------------------
+
   public updateRaycast(reach = 6.0) {
     _raycaster.setFromCamera(_center, this.camera);
+    this.highlightBox.position.set(0, 0, 0);
 
-    const activeMeshes: THREE.InstancedMesh[] = [];
-    for (const mesh of this.blockMeshes.values()) {
-      if (mesh.count > 0) activeMeshes.push(mesh);
-    }
-
+    const activeMeshes = this.activeBlockMeshes();
     const intersects = _raycaster.intersectObjects(activeMeshes, false);
     let validHit: RaycastHit | null = null;
 
     for (const hit of intersects) {
       if (hit.distance > reach || !hit.point || !hit.face) continue;
 
-      // Calculate voxel center by stepping slightly along ray inside block
       const insidePoint = hit.point.clone().addScaledVector(_raycaster.ray.direction, 0.005);
       const bx = Math.floor(insidePoint.x);
       const by = Math.floor(insidePoint.y);
@@ -418,7 +578,6 @@ export class GameRenderer {
       const block = this.world.getBlock(bx, by, bz);
       if (block === 'air' || block === 'water') continue;
 
-      // Position where a newly placed block would sit
       const placeX = bx + Math.round(hit.face.normal.x);
       const placeY = by + Math.round(hit.face.normal.y);
       const placeZ = bz + Math.round(hit.face.normal.z);
@@ -446,13 +605,15 @@ export class GameRenderer {
     }
   }
 
-  // Update Primed TNT explosions & flash
+  // -------------------------------------------------------------------------
+  // TNT
+  // -------------------------------------------------------------------------
+
   private updatePrimedTNTs(delta: number) {
     for (let i = this.primedTNTs.length - 1; i >= 0; i--) {
       const t = this.primedTNTs[i];
       t.timer -= delta;
 
-      // Expand and flash white
       const flash = Math.sin(t.timer * 20) > 0;
       const s = 1.0 + (3.0 - t.timer) * 0.08;
       t.mesh.scale.set(s, s, s);
@@ -462,9 +623,7 @@ export class GameRenderer {
       }
 
       if (t.timer <= 0) {
-        // Boom!
         this.scene.remove(t.mesh);
-        t.mesh.geometry.dispose();
         this.primedTNTs.splice(i, 1);
 
         soundEngine.playExplosion();
@@ -478,21 +637,20 @@ export class GameRenderer {
     }
   }
 
-  // Hand swing and walk bobbing animation
+  // -------------------------------------------------------------------------
+  // Hand animation
+  // -------------------------------------------------------------------------
+
   private updateHand(delta: number) {
-    // Walking bob
     const isMoving = this.physics.velocity.lengthSq() > 0.5 && this.physics.isGrounded;
-    if (isMoving) {
-      this.walkBob += delta * 10;
-    } else {
-      this.walkBob += delta * 2;
-    }
+    if (isMoving) this.walkBob += delta * 10;
+    else this.walkBob += delta * 2;
+
     const bobX = Math.cos(this.walkBob) * (isMoving ? 0.02 : 0.005);
     const bobY = Math.sin(this.walkBob * 2) * (isMoving ? 0.025 : 0.008);
 
-    // Punch swing
     if (this.isSwinging) {
-      this.swingProgress += delta * 5.0; // quick punch in ~0.2s
+      this.swingProgress += delta * 5.0;
       if (this.swingProgress >= 1.0) {
         this.swingProgress = 0;
         this.isSwinging = false;
@@ -500,56 +658,76 @@ export class GameRenderer {
     }
     const swingAngle = Math.sin(this.swingProgress * Math.PI) * 0.5;
 
-    this.handBlockMesh.position.set(0.42 + bobX, -0.38 + bobY - swingAngle * 0.2, -0.65 - swingAngle * 0.3);
-    this.handBlockMesh.rotation.set(0.3 + swingAngle * 0.8, -0.5 - swingAngle * 0.4, 0.2 + swingAngle * 0.3);
+    this.handAnchor.position.set(
+      0.42 + bobX,
+      -0.38 + bobY - swingAngle * 0.2,
+      -0.65 - swingAngle * 0.3
+    );
+    this.handAnchor.rotation.set(swingAngle * 0.8, -swingAngle * 0.4, swingAngle * 0.3);
   }
 
-  // Software WebGL pacing helper (as mandated by Three.js architectural guidelines)
+  // -------------------------------------------------------------------------
+  // Boucle
+  // -------------------------------------------------------------------------
+
   private afterDraw(cb: () => void) {
     const gl = this.renderer.getContext() as WebGL2RenderingContext;
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
     gl.flush();
+    const startedAt = performance.now();
     const poll = () => {
       if (this.isDisposed) return;
-      const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
-      if (state === gl.UNSIGNALED) {
-        this.animFrameId = window.setTimeout(poll, 5);
-      } else {
-        if (sync) gl.deleteSync(sync);
-        this.animFrameId = window.setTimeout(cb, 60);
+      let state: number = gl.SIGNALED;
+      try {
+        state = sync ? gl.getSyncParameter(sync, gl.SYNC_STATUS) : gl.SIGNALED;
+      } catch {
+        state = gl.SIGNALED; // contexte perdu : on continue, le renderer signalera l'erreur
       }
+      // Ne jamais bloquer la boucle indéfiniment si le GPU ne signale pas son fence
+      // (pilote logiciel bloqué ou contexte perdu).
+      if (state === gl.UNSIGNALED && performance.now() - startedAt < 1000) {
+        this.animFrameId = window.setTimeout(poll, 5);
+        return;
+      }
+      if (sync) gl.deleteSync(sync);
+      this.animFrameId = window.setTimeout(cb, 60);
     };
     this.animFrameId = window.setTimeout(poll, 5);
   }
 
   private lastTime = performance.now();
+  private lastChunkSync = 0;
 
   private startLoop() {
     const tick = () => {
       if (this.isDisposed) return;
 
       const now = performance.now();
-      const delta = Math.min((now - this.lastTime) / 1000, 0.08);
+      const rawDelta = (now - this.lastTime) / 1000;
+      const delta = Math.min(rawDelta, 0.08);
       this.lastTime = now;
 
-      // Update camera from physics
       const eyePos = this.physics.getEyePosition();
       this.camera.position.copy(eyePos);
       this.camera.rotation.order = 'YXZ';
       this.camera.rotation.y = this.physics.yaw;
       this.camera.rotation.x = this.physics.pitch;
 
-      // Subsystem updates
-      this.updateDayNight(delta);
+      this.updateDayNight(Math.min(rawDelta, 1));
       this.updateRaycast();
       this.updateHand(delta);
       this.updatePrimedTNTs(delta);
+      this.mobs.update(delta, this.physics.position, this.isDay, this.onPlayerHit);
       this.particles.update(delta);
 
-      // Render
+      // Synchronisation des chunks (chargement / déchargement)
+      if (now - this.lastChunkSync > 200) {
+        this.lastChunkSync = now;
+        this.syncChunks();
+      }
+
       this.renderer.render(this.scene, this.camera);
 
-      // Frame pacing: software WebGL pacing vs rAF GPU loop
       if (this.isSoftwareGl) {
         this.afterDraw(tick);
       } else {
@@ -557,11 +735,8 @@ export class GameRenderer {
       }
     };
 
-    if (this.isSoftwareGl) {
-      this.afterDraw(tick);
-    } else {
-      this.animFrameId = requestAnimationFrame(tick);
-    }
+    if (this.isSoftwareGl) this.afterDraw(tick);
+    else this.animFrameId = requestAnimationFrame(tick);
   }
 
   private onResize = () => {
@@ -576,12 +751,11 @@ export class GameRenderer {
   public dispose() {
     this.isDisposed = true;
     window.removeEventListener('resize', this.onResize);
-    if (this.isSoftwareGl) {
-      clearTimeout(this.animFrameId);
-    } else {
-      cancelAnimationFrame(this.animFrameId);
-    }
+    if (this.isSoftwareGl) clearTimeout(this.animFrameId);
+    else cancelAnimationFrame(this.animFrameId);
     this.particles.dispose();
+    this.mobs.dispose();
+    this.clearChunkMeshes();
     this.renderer.dispose();
     if (this.renderer.domElement.parentElement) {
       this.renderer.domElement.parentElement.removeChild(this.renderer.domElement);

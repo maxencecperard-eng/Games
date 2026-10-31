@@ -219,6 +219,26 @@ class SoundEngine {
     osc.stop(now + 0.15);
   }
 
+  public playHurt() {
+    this.initContext();
+    if (this.isMuted || !this.ctx || !this.masterGain) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(320, now);
+    osc.frequency.exponentialRampToValueAtTime(110, now + 0.18);
+
+    gain.gain.setValueAtTime(0.16, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+
+    osc.connect(gain);
+    gain.connect(this.masterGain);
+    osc.start(now);
+    osc.stop(now + 0.21);
+  }
+
   public playTNTFuse() {
     this.initContext();
     if (this.isMuted || !this.ctx || !this.masterGain) return;

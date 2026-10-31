@@ -36,13 +36,13 @@ export class PlayerPhysics {
   }
 
   public findSpawnPosition() {
-    // Search spiral around (0, 0) up to radius 18 for solid surface ground above sea level
-    for (let r = 0; r <= 18; r += 2) {
+    // Search spiral around (0, 0) for solid surface ground above sea level
+    for (let r = 0; r <= 24; r += 2) {
       for (let dx = -r; dx <= r; dx += 2) {
         for (let dz = -r; dz <= r; dz += 2) {
           const sx = dx;
           const sz = dz;
-          for (let y = this.world.height - 1; y >= this.world.seaLevel; y--) {
+          for (let y = this.world.maxY - 1; y >= this.world.seaLevel; y--) {
             const b = this.world.getBlock(sx, y, sz);
             if (b !== 'air' && b !== 'water' && BLOCK_REGISTRY[b]?.solid) {
               this.position.set(sx + 0.5, y + 1.0, sz + 0.5);
@@ -53,7 +53,7 @@ export class PlayerPhysics {
         }
       }
     }
-    this.position.set(0.5, 26, 0.5);
+    this.position.set(0.5, this.world.seaLevel + 8, 0.5);
   }
 
   public toggleFly() {

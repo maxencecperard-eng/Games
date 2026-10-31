@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { BlockType } from './types';
+import { ItemId } from './items';
 
 // Helper to create a 16x16 canvas
 function create16Canvas(): [HTMLCanvasElement, CanvasRenderingContext2D] {
@@ -259,6 +260,72 @@ function generateOreCanvas(gemColor: string, gemGlint: string): HTMLCanvasElemen
   return canvas;
 }
 
+function generateToolIcon(
+  kind: 'sword' | 'pickaxe' | 'stick',
+  color: string,
+  edge: string
+): HTMLCanvasElement {
+  const [canvas, ctx] = create16Canvas();
+  const px = (x: number, y: number, c: string) => {
+    if (x < 0 || x > 15 || y < 0 || y > 15) return;
+    ctx.fillStyle = c;
+    ctx.fillRect(x, y, 1, 1);
+  };
+  const handle = '#6b4a2b';
+  const handleDark = '#4a2f18';
+
+  if (kind === 'stick') {
+    for (let i = 0; i < 8; i++) {
+      px(4 + i, 12 - i, handle);
+      px(5 + i, 12 - i, handleDark);
+    }
+    return canvas;
+  }
+
+  if (kind === 'sword') {
+    // Lame diagonale
+    for (let i = 0; i < 8; i++) {
+      px(6 + i, 9 - i, color);
+      px(7 + i, 9 - i, edge);
+    }
+    // Garde
+    px(5, 9, '#c9a227');
+    px(6, 10, '#c9a227');
+    px(4, 8, '#c9a227');
+    // Poignée
+    px(5, 10, handle);
+    px(4, 11, handle);
+    px(3, 12, handle);
+    px(2, 13, handleDark);
+    return canvas;
+  }
+
+  // Pioche
+  for (let i = 0; i < 7; i++) {
+    px(4 + i, 12 - i, handle);
+    px(5 + i, 12 - i, handleDark);
+  }
+  const head: [number, number][] = [
+    [7, 4],
+    [8, 3],
+    [9, 3],
+    [10, 3],
+    [11, 4],
+    [12, 5],
+    [7, 5],
+    [8, 4],
+    [9, 4],
+    [10, 4],
+    [11, 5],
+  ];
+  for (const [x, y] of head) px(x, y, color);
+  px(9, 3, edge);
+  px(10, 3, edge);
+  px(8, 4, edge);
+  return canvas;
+}
+
+
 function generateGlowstoneCanvas(): HTMLCanvasElement {
   const [canvas, ctx] = create16Canvas();
   const golds = ['#ffe168', '#f8c83a', '#df9a1b', '#ffec94', '#c9820f'];
@@ -495,6 +562,7 @@ export interface BlockMaterialSet {
 
 export class TextureManager {
   private materialsCache: Map<BlockType, BlockMaterialSet> = new Map();
+  private itemIcons: Map<string, string> = new Map();
 
   constructor() {
     this.initTextures();
@@ -516,6 +584,9 @@ export class TextureManager {
     const diamondOreCanvas = generateOreCanvas('#4dedf4', '#ffffff');
     const goldOreCanvas = generateOreCanvas('#fcee4b', '#ffffff');
     const ironOreCanvas = generateOreCanvas('#d8af93', '#fdf3ea');
+    const coalOreCanvas = generateOreCanvas('#2b2b2b', '#6b6b6b');
+    const redstoneOreCanvas = generateOreCanvas('#d61d1d', '#ff7b7b');
+    const emeraldOreCanvas = generateOreCanvas('#22c55e', '#b9f6ca');
     const glowstoneCanvas = generateGlowstoneCanvas();
     const obsidianCanvas = generateObsidianCanvas();
     const tntSideCanvas = generateTNTSideCanvas();
@@ -546,6 +617,9 @@ export class TextureManager {
     const diamondOreTex = canvasToTexture(diamondOreCanvas);
     const goldOreTex = canvasToTexture(goldOreCanvas);
     const ironOreTex = canvasToTexture(ironOreCanvas);
+    const coalOreTex = canvasToTexture(coalOreCanvas);
+    const redstoneOreTex = canvasToTexture(redstoneOreCanvas);
+    const emeraldOreTex = canvasToTexture(emeraldOreCanvas);
     const glowstoneTex = canvasToTexture(glowstoneCanvas);
     const obsidianTex = canvasToTexture(obsidianCanvas);
     const tntSideTex = canvasToTexture(tntSideCanvas);
@@ -669,6 +743,27 @@ export class TextureManager {
       iconDataUrl: ironOreCanvas.toDataURL(),
     });
 
+    // 13b. Coal Ore
+    const coalMat = makeMat(coalOreTex, false, 1.0, 0.9);
+    this.materialsCache.set('coal_ore', {
+      materials: Array(6).fill(coalMat),
+      iconDataUrl: coalOreCanvas.toDataURL(),
+    });
+
+    // 13c. Redstone Ore
+    const redstoneMat = makeMat(redstoneOreTex, false, 1.0, 0.5);
+    this.materialsCache.set('redstone_ore', {
+      materials: Array(6).fill(redstoneMat),
+      iconDataUrl: redstoneOreCanvas.toDataURL(),
+    });
+
+    // 13d. Emerald Ore
+    const emeraldMat = makeMat(emeraldOreTex, false, 1.0, 0.4);
+    this.materialsCache.set('emerald_ore', {
+      materials: Array(6).fill(emeraldMat),
+      iconDataUrl: emeraldOreCanvas.toDataURL(),
+    });
+
     // 14. Glowstone
     const glowMat = new THREE.MeshStandardMaterial({
       map: glowstoneTex,
@@ -776,6 +871,36 @@ export class TextureManager {
       icons[key] = value.iconDataUrl;
     }
     return icons as Record<BlockType, string>;
+  }
+
+  /** Icône d'un objet : texture de bloc ou pixel-art généré pour les outils. */
+  public getItemIcon(item: ItemId): string {
+    const blockIcon = this.materialsCache.get(item as BlockType)?.iconDataUrl;
+    if (blockIcon) return blockIcon;
+
+    const cached = this.itemIcons.get(item);
+    if (cached) return cached;
+
+    const tierColors: Record<string, [string, string]> = {
+      wood: ['#b8945f', '#e0c089'],
+      stone: ['#8f8f8f', '#c4c4c4'],
+      iron: ['#d8d8d8', '#ffffff'],
+      diamond: ['#4dedf4', '#c9feff'],
+    };
+    const prefix = String(item).split('_')[0];
+    const [color, edge] = tierColors[prefix] || ['#b8945f', '#e0c089'];
+
+    let url = '';
+    if (item === 'stick') {
+      url = generateToolIcon('stick', color, edge).toDataURL();
+    } else if (String(item).endsWith('_sword')) {
+      url = generateToolIcon('sword', color, edge).toDataURL();
+    } else if (String(item).endsWith('_pickaxe')) {
+      url = generateToolIcon('pickaxe', color, edge).toDataURL();
+    }
+
+    this.itemIcons.set(item, url);
+    return url;
   }
 }
 
